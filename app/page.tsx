@@ -65,68 +65,62 @@ export default function Home() {
   };
 
   return (
-    <main className="min-h-screen bg-slate-50 text-slate-800 pb-16">
-      {/* ヘッダー */}
-      <header className="bg-white border-b border-slate-200 sticky top-0 z-10 shadow-sm">
-        <div className="max-w-2xl mx-auto px-4 py-4 text-center">
-          <h1 className="text-xl sm:text-2xl font-bold text-slate-900 flex items-center justify-center gap-2">
-            🏢 物件AIアナライザー
+    <main className="min-h-screen bg-gray-50 text-gray-800 p-4 sm:p-8">
+      <div className="max-w-2xl mx-auto space-y-6">
+        {/* タイトル */}
+        <div className="text-center space-y-2">
+          <h1 className="text-2xl sm:text-3xl font-bold text-gray-900">
+            物件画像 AI解析
           </h1>
-          <p className="text-xs sm:text-sm text-slate-500 mt-1">
-            マイソク・間取り図からAIが最適診断
+          <p className="text-xs sm:text-sm text-gray-500">
+            マイソクや間取り図をアップロードしてAI診断
           </p>
         </div>
-      </header>
 
-      <div className="max-w-2xl mx-auto px-4 pt-6 space-y-6">
-        {/* STEP 1: 目的の選択 */}
-        <div className="bg-white p-4 sm:p-6 rounded-2xl shadow-sm border border-slate-200">
-          <label className="block text-sm sm:text-base font-bold text-slate-700 mb-3">
-            1. 検討目的を選択してください
+        {/* 評価目的の切り替え */}
+        <div className="bg-white p-4 rounded-xl shadow-sm border border-gray-200">
+          <label className="block text-xs sm:text-sm font-semibold text-gray-700 mb-2">
+            評価視点を選択
           </label>
-          <div className="grid grid-cols-3 gap-2 sm:gap-3">
+          <div className="grid grid-cols-3 gap-2">
             <button
               type="button"
               onClick={() => setTargetType("single")}
-              className={`py-3 px-2 rounded-xl text-xs sm:text-sm font-bold transition-all border text-center ${
+              className={`py-2.5 px-2 text-xs sm:text-sm font-medium rounded-lg border transition-all ${
                 targetType === "single"
-                  ? "bg-blue-600 text-white border-blue-600 shadow-sm scale-[1.02]"
-                  : "bg-slate-50 text-slate-600 border-slate-200 hover:bg-slate-100"
+                  ? "bg-blue-600 text-white border-blue-600 shadow-sm"
+                  : "bg-gray-50 text-gray-600 border-gray-200 hover:bg-gray-100"
               }`}
             >
-              👤 一人暮らし
+              一人暮らし
             </button>
             <button
               type="button"
               onClick={() => setTargetType("family")}
-              className={`py-3 px-2 rounded-xl text-xs sm:text-sm font-bold transition-all border text-center ${
+              className={`py-2.5 px-2 text-xs sm:text-sm font-medium rounded-lg border transition-all ${
                 targetType === "family"
-                  ? "bg-blue-600 text-white border-blue-600 shadow-sm scale-[1.02]"
-                  : "bg-slate-50 text-slate-600 border-slate-200 hover:bg-slate-100"
+                  ? "bg-blue-600 text-white border-blue-600 shadow-sm"
+                  : "bg-gray-50 text-gray-600 border-gray-200 hover:bg-gray-100"
               }`}
             >
-              👨‍👩‍👧 ファミリー
+              ファミリー
             </button>
             <button
               type="button"
               onClick={() => setTargetType("investment")}
-              className={`py-3 px-2 rounded-xl text-xs sm:text-sm font-bold transition-all border text-center ${
+              className={`py-2.5 px-2 text-xs sm:text-sm font-medium rounded-lg border transition-all ${
                 targetType === "investment"
-                  ? "bg-blue-600 text-white border-blue-600 shadow-sm scale-[1.02]"
-                  : "bg-slate-50 text-slate-600 border-slate-200 hover:bg-slate-100"
+                  ? "bg-blue-600 text-white border-blue-600 shadow-sm"
+                  : "bg-gray-50 text-gray-600 border-gray-200 hover:bg-gray-100"
               }`}
             >
-              📈 収益物件用
+              収益物件用
             </button>
           </div>
         </div>
 
-        {/* STEP 2: 画像アップロード */}
-        <div className="bg-white p-4 sm:p-6 rounded-2xl shadow-sm border border-slate-200">
-          <label className="block text-sm sm:text-base font-bold text-slate-700 mb-3">
-            2. 物件画像（マイソク・図面）を添付
-          </label>
-          
+        {/* 画像アップロードエリア */}
+        <div className="bg-white p-4 sm:p-6 rounded-xl shadow-sm border border-gray-200 space-y-4">
           <input
             type="file"
             accept="image/*"
@@ -134,130 +128,109 @@ export default function Home() {
             id="file-upload"
             className="hidden"
           />
-          
           <label
             htmlFor="file-upload"
-            className="flex flex-col items-center justify-center p-6 border-2 border-dashed border-slate-300 rounded-xl cursor-pointer hover:border-blue-500 hover:bg-blue-50/50 transition-all text-center"
+            className="flex flex-col items-center justify-center p-6 border-2 border-dashed border-gray-300 rounded-lg cursor-pointer hover:border-blue-500 hover:bg-blue-50/50 transition-all text-center min-h-[160px]"
           >
             {selectedImage ? (
-              <div className="relative w-full h-48 sm:h-64">
+              <div className="relative w-full h-48 sm:h-56">
                 <Image
                   src={selectedImage}
                   alt="物件プレビュー"
                   fill
-                  className="object-contain rounded-lg"
+                  className="object-contain rounded"
                 />
               </div>
             ) : (
-              <div className="space-y-2 py-4">
-                <div className="text-4xl">📸</div>
-                <p className="text-sm sm:text-base font-bold text-slate-700">
-                  タップして画像を選択
-                </p>
-                <p className="text-xs text-slate-400">
-                  マイソク・図面・スクリーンショット等
-                </p>
+              <div className="space-y-1 text-gray-500">
+                <div className="text-3xl mb-1">📁</div>
+                <p className="text-sm font-semibold">タップして画像を選択</p>
+                <p className="text-xs text-gray-400">マイソク・間取り図・写真など</p>
               </div>
             )}
           </label>
 
-          {/* 解析実行ボタン */}
           <button
             type="button"
             onClick={handleAnalyze}
             disabled={!selectedImage || loading}
-            className={`w-full mt-4 py-4 rounded-xl text-base sm:text-lg font-bold transition-all shadow-md active:scale-[0.99] ${
+            className={`w-full py-3.5 px-4 rounded-lg text-sm sm:text-base font-bold transition-all shadow ${
               !selectedImage || loading
-                ? "bg-slate-300 text-slate-500 cursor-not-allowed"
-                : "bg-blue-600 text-white hover:bg-blue-700"
+                ? "bg-gray-300 text-gray-500 cursor-not-allowed"
+                : "bg-blue-600 text-white hover:bg-blue-700 active:scale-[0.98]"
             }`}
           >
-            {loading ? "🔍 AIが詳しく解析中..." : "🚀 AIで物件を解析する"}
+            {loading ? "解析中..." : "物件を解析する"}
           </button>
         </div>
 
         {/* エラー表示 */}
         {error && (
-          <div className="bg-red-50 text-red-600 p-4 rounded-xl border border-red-200 text-sm font-medium">
-            ⚠️ {error}
+          <div className="p-4 bg-red-50 text-red-600 text-sm rounded-lg border border-red-200">
+            {error}
           </div>
         )}
 
-        {/* STEP 3: 解析結果表示 */}
+        {/* 解析結果表示 */}
         {result && (
-          <div className="bg-white p-5 sm:p-8 rounded-2xl shadow-md border border-slate-200 space-y-6">
-            {/* 物件名 ＆ スコア */}
-            <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 pb-4 border-b border-slate-100">
+          <div className="bg-white p-5 sm:p-6 rounded-xl shadow-sm border border-gray-200 space-y-5">
+            <div className="flex justify-between items-start border-b pb-4">
               <div>
-                <span className="text-xs font-bold px-2.5 py-1 rounded-full bg-blue-100 text-blue-700 inline-block mb-2">
-                  {targetType === "single" && "一人暮らし向け評価"}
-                  {targetType === "family" && "ファミリー向け評価"}
-                  {targetType === "investment" && "収益物件向け評価"}
+                <span className="text-xs text-blue-600 font-semibold bg-blue-50 px-2 py-0.5 rounded">
+                  {targetType === "single" && "一人暮らし向け"}
+                  {targetType === "family" && "ファミリー向け"}
+                  {targetType === "investment" && "収益物件用"}
                 </span>
-                <h2 className="text-lg sm:text-xl font-bold text-slate-900">
+                <h2 className="text-lg font-bold text-gray-900 mt-1">
                   {result.propertyName}
                 </h2>
               </div>
-              <div className="flex items-baseline gap-1 bg-amber-50 px-4 py-2 rounded-2xl border border-amber-200 self-end sm:self-auto">
-                <span className="text-xs text-amber-700 font-bold">評価点:</span>
-                <span className="text-3xl font-extrabold text-amber-600">
-                  {result.score}
+              <div className="text-right">
+                <span className="text-xs text-gray-500 block">総合スコア</span>
+                <span className="text-2xl font-bold text-blue-600">
+                  {result.score}<span className="text-xs text-gray-400"> / 100</span>
                 </span>
-                <span className="text-xs text-amber-600 font-bold">/ 100</span>
               </div>
             </div>
 
-            {/* サマリー */}
             <div>
-              <h3 className="text-sm font-bold text-slate-700 mb-2">📝 概要診断</h3>
-              <p className="text-sm sm:text-base text-slate-600 leading-relaxed bg-slate-50 p-4 rounded-xl">
+              <h3 className="text-xs font-semibold text-gray-500 mb-1">概要診断</h3>
+              <p className="text-sm text-gray-700 leading-relaxed bg-gray-50 p-3 rounded-lg">
                 {result.summary}
               </p>
             </div>
 
-            {/* メリット */}
             <div>
-              <h3 className="text-sm font-bold text-emerald-700 mb-2">✨ おすすめポイント（メリット）</h3>
-              <ul className="space-y-2">
-                {result.pros.map((pro, index) => (
-                  <li
-                    key={index}
-                    className="text-xs sm:text-sm text-slate-700 bg-emerald-50/60 p-3 rounded-lg border border-emerald-100 flex items-start gap-2"
-                  >
-                    <span className="text-emerald-500 font-bold">✓</span>
+              <h3 className="text-xs font-semibold text-green-700 mb-2">長所・メリット</h3>
+              <ul className="space-y-1.5">
+                {result.pros.map((pro, idx) => (
+                  <li key={idx} className="text-xs sm:text-sm text-gray-700 flex items-start gap-1.5 bg-green-50/50 p-2 rounded">
+                    <span className="text-green-600 font-bold">✓</span>
                     {pro}
                   </li>
                 ))}
               </ul>
             </div>
 
-            {/* デメリット */}
             <div>
-              <h3 className="text-sm font-bold text-rose-700 mb-2">⚠️ 気になる点（デメリット）</h3>
-              <ul className="space-y-2">
-                {result.cons.map((con, index) => (
-                  <li
-                    key={index}
-                    className="text-xs sm:text-sm text-slate-700 bg-rose-50/60 p-3 rounded-lg border border-rose-100 flex items-start gap-2"
-                  >
-                    <span className="text-rose-500 font-bold">!</span>
+              <h3 className="text-xs font-semibold text-red-700 mb-2">短所・注意点</h3>
+              <ul className="space-y-1.5">
+                {result.cons.map((con, idx) => (
+                  <li key={idx} className="text-xs sm:text-sm text-gray-700 flex items-start gap-1.5 bg-red-50/50 p-2 rounded">
+                    <span className="text-red-500 font-bold">▲</span>
                     {con}
                   </li>
                 ))}
               </ul>
             </div>
 
-            {/* 内見時の確認ポイント */}
             <div>
-              <h3 className="text-sm font-bold text-blue-700 mb-2">🔍 内見時のチェックポイント</h3>
-              <ul className="space-y-2">
-                {result.checkpoints.map((point, index) => (
-                  <li
-                    key={index}
-                    className="text-xs sm:text-sm text-slate-700 bg-blue-50/60 p-3 rounded-lg border border-blue-100 flex items-start gap-2"
-                  >
+              <h3 className="text-xs font-semibold text-blue-700 mb-2">内見時のチェックポイント</h3>
+              <ul className="space-y-1.5">
+                {result.checkpoints.map((pt, idx) => (
+                  <li key={idx} className="text-xs sm:text-sm text-gray-700 flex items-start gap-1.5 bg-blue-50/50 p-2 rounded">
                     <span className="text-blue-500 font-bold">・</span>
-                    {point}
+                    {pt}
                   </li>
                 ))}
               </ul>
