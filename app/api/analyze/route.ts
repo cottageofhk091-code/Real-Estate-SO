@@ -1,91 +1,96 @@
-import { NextRequest, NextResponse } from "next/server";
-import { GoogleGenerativeAI } from "@google/generative-ai";
+// app/api/analyze/route.ts
+import { GoogleGenAI } from '@google/genai';
+import { NextResponse } from 'next/server';
 
-const apiKey = process.env.GEMINI_API_KEY;
-const genAI = new GoogleGenerativeAI(apiKey || "");
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
-export async function POST(req: NextRequest) {
+export async function POST(request: Request) {
   try {
-    if (!apiKey) {
-      return NextResponse.json(
-        { error: "GEMINI_API_KEYが設定されていません。" },
-        { status: 500 }
-      );
-    }
+    const { text, images } = await request.json();
 
-    const body = await req.json();
-    const { image, targetType = "single" } = body;
-
-    if (!image) {
+    if (!text && (!images || images.length === 0)) {
       return NextResponse.json(
-        { error: "画像データが見つかりません。" },
+        { error: 'テキストまたは画像を少なくとも1つ入力してください。' },
         { status: 400 }
       );
     }
 
-    const base64Data = image.replace(/^data:image\/\w+;base64,/, "");
-    const mimeTypeMatch = image.match(/^data:(image\/\w+);base64,/);
-    const mimeType = mimeTypeMatch ? mimeTypeMatch[1] : "image/jpeg";
-
-    // 目的別の追加指示
-    let targetContext = "";
-    if (targetType === "family") {
-      targetContext = "【分析視点：ファミリー向け】特に子育て環境、治安・安全面、家事動線や収納力、周辺の生活利便性を重視して評価してください。";
-    } else if (targetType === "investment") {
-      targetContext = "【分析視点：収益物件用】特に資産価値、将来の空室リスク、修繕コストリスク、想定ターゲットへの訴求力を重視して評価してください。";
-    } else {
-      targetContext = "【分析視点：一人暮らし向け】特に通勤通学の利便性、近隣の買い出し環境、防犯性・設備スペック、コスパを重視して評価してください。";
-    }
-
-    const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
-
     const prompt = `
-あなたはプロの不動産コンサルタントです。添付された物件画像（マイソク、間取り図、物件写真等）を詳しく分析し、以下の条件に従って評価を行ってください。
+あなたはプロの不動産コンサルタントおよび一級建築士の視点を持つ「不動産査定・セカンドオピニオンAI」です。
+ユーザーから提供された物件情報（テキストおよび画像）をプロの目で厳しく精査し、以下のJSON形式厳守で詳細な査定・アドバイスを出力してください。
 
-${targetContext}
+【出力要件】
+1. 単なる要約ではなく、購入・賃貸を検討しているユーザーが失敗しないための「プロならではの具体的・多角的なアドバイス」を記述してください。
+2. 専門用語を使う場合は分かりやすく解説を補足してください。
+3. リスクやデメリットも隠さず客観的に指摘してください。
 
-回答は必ず以下のJSON形式のみで返してください。余計な解説やMarkdown装飾は含めないでください。
-
+【出力JSONフォーマット】（※必ずこのJSONのみを出力してください）
 {
-  "propertyName": "物件名（不明な場合は'該当物件'）",
-  "score": 80,
-  "summary": "物件の全体的な評価・概要まとめ（150〜200文字程度）",
+  "score": 85,
+  "summary": "物件の全体像、コスパ、総合的なおすすめ度を解説した概要文章（200〜300文字程度）",
   "pros": [
-    "メリット・良い点1",
-    "メリット・良い点2",
-    "メリット・良い点3"
+    "おすすめポイント1（具体的な理由やメリット）",
+    "おすすめポイント2",
+    "おすすめポイント3"
   ],
   "cons": [
-    "デメリット・気になる点1",
-    "デメリット・気になる点2",
-    "デメリット・気になる点3"
+    "懸念点・リスク1（注意すべき理由や対策）",
+    "懸念点・リスク2",
+    "懸念点・リスク3"
   ],
-  "checkpoints": [
-    "内見時や事前確認でのチェックポイント1",
-    "内見時や事前確認でのチェックポイント2"
+  "details": {
+    "priceEvaluation": "周辺相場との比較、家賃・管理費・初期費用の適正感についての解説",
+    "locationEvaluation": "駅徒歩、周辺の買い出し・治安・生活利便性、日当たりや周辺環境のリスク評価",
+    "layoutEvaluation": "間取りの使い勝手、生活動線、収納量、構造による防音性・耐震性の評価"
+  },
+  "viewingChecklist": [
+    "【場所/項目】内見時に現地で確認すべき具体的なチェックポイント1",
+    "【場所/項目】内見時に現地で確認すべき具体的なチェックポイント2",
+    "【場所/項目】内見時に現地で確認すべき具体的なチェックポイント3",
+    "【場所/項目】内見時に現地で確認すべき具体的なチェックポイント4",
+    "【場所/項目】内見時に現地で確認すべき具体的なチェックポイント5"
   ]
 }
+
+以下が入力された物件情報です：
+${text ? `【テキスト情報】:\n${text}\n` : ''}
+${images && images.length > 0 ? `【画像添付あり】: 送信された画像・間取り図も総合的に判断してください。` : ''}
 `;
 
-    const result = await model.generateContent([
-      prompt,
-      {
-        inlineData: {
-          data: base64Data,
-          mimeType: mimeType,
-        },
+    const contents: any[] = [{ text: prompt }];
+
+    if (images && images.length > 0) {
+      images.forEach((img: { inlineData: { mimeType: string; data: string } }) => {
+        contents.push({
+          inlineData: {
+            mimeType: img.inlineData.mimeType,
+            data: img.inlineData.data,
+          },
+        });
+      });
+    }
+
+    const response = await ai.models.generateContent({
+      model: 'gemini-2.5-flash',
+      contents: contents,
+      config: {
+        responseMimeType: 'application/json',
       },
-    ]);
+    });
 
-    const responseText = result.response.text();
-    const cleanedText = responseText.replace(/```json/g, "").replace(/```/g, "").trim();
-    const analysisResult = JSON.parse(cleanedText);
+    const responseText = response.text;
+    if (!responseText) {
+      throw new Error('AIからの応答が空でした。');
+    }
 
-    return NextResponse.json(analysisResult);
+    const cleanedText = responseText.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+    const parsedData = JSON.parse(cleanedText);
+
+    return NextResponse.json(parsedData);
   } catch (error: any) {
-    console.error("Analysis Error:", error);
+    console.error('Analysis error:', error);
     return NextResponse.json(
-      { error: "物件情報の解析中にエラーが発生しました。" },
+      { error: error.message || '解析処理中にエラーが発生しました。' },
       { status: 500 }
     );
   }
