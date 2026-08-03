@@ -362,7 +362,7 @@ ${
             generation_config: {
               temperature: 0.2,
               max_output_tokens: 4096,
-            },
+            } as any,
           }),
           new Promise<never>((_, reject) => {
             abortController.signal.addEventListener(
