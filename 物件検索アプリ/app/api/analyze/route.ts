@@ -352,7 +352,8 @@ ${
       );
 
       try {
-        interaction = await Promise.race([
+        // interactions.create が union 型を返すため、Promise.race 代入で型エラーになるのを回避
+        interaction = (await Promise.race([
           ai.interactions.create({
             model: MODEL,
             store: false,
@@ -370,7 +371,7 @@ ${
               { once: true },
             );
           }),
-        ]);
+        ])) as any;
         lastApiError = undefined;
         clearTimeout(timeoutId);
         break;
