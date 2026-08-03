@@ -1,97 +1,152 @@
-// app/api/analyze/route.ts
-import { GoogleGenAI } from '@google/genai';
 import { NextResponse } from 'next/server';
+import { GEMINI_ANALYZE_MODELS, generateGeminiContentWithFallback } from '@/lib/gemini';
 
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || '' });
+type PropertyType = 'rental' | 'purchase';
+type HouseholdType = 'single' | 'family';
 
-export async function POST(request: Request) {
+function labelPropertyType(type: PropertyType | string | undefined): string {
+  return type === 'purchase' ? '分譲（購入）' : '賃貸';
+}
+
+function labelHouseholdType(type: HouseholdType | string | undefined): string {
+  return type === 'family' ? 'ファミリー（同居あり）' : '一人暮らし';
+}
+
+export async function POST(req: Request) {
   try {
-    const { text, images } = await request.json();
+    const { text, images, propertyType, householdType } = await req.json();
 
     if (!text && (!images || images.length === 0)) {
       return NextResponse.json(
-        { error: 'テキストまたは画像を少なくとも1つ入力してください。' },
+        { error: 'テキストまたは画像を入力してください。' },
         { status: 400 }
       );
     }
 
+    if (!process.env.GEMINI_API_KEY) {
+      return NextResponse.json({ error: 'サーバー側の設定エラーです。' }, { status: 500 });
+    }
+
+    const propertyLabel = labelPropertyType(propertyType);
+    const householdLabel = labelHouseholdType(householdType);
+    const isRental = propertyType !== 'purchase';
+
     const prompt = `
-あなたはプロの不動産コンサルタントおよび一級建築士の視点を持つ「不動産査定・セカンドオピニオンAI」です。
-ユーザーから提供された物件情報（テキストおよび画像）をプロの目で厳しく精査し、以下のJSON形式厳守で詳細な査定・アドバイスを出力してください。
+あなたはプロの不動産鑑定士・宅地建物取引士です。
+以下の物件情報を客観的かつ厳しく分析し、レスポンスを返してください。
 
-【出力要件】
-1. 単なる要約ではなく、購入・賃貸を検討しているユーザーが失敗しないための「プロならではの具体的・多角的なアドバイス」を記述してください。
-2. 専門用語を使う場合は分かりやすく解説を補足してください。
-3. リスクやデメリットも隠さず客観的に指摘してください。
+【ユーザーの前提条件（重要）】
+ユーザーは【${propertyLabel}】かつ【${householdLabel}】を探しています。
+分析・評価・チェックリストは、この前提に最適化してください。
+- 賃貸の場合: 家賃交渉余地、更新料、退去時コスト、騒音・隣人リスク、更新後の家賃上昇リスクなどを重視
+- 分譲（購入）の場合: 資産価値、管理状態、修繕積立、将来のリセール、ローン適格性などを重視
+- 一人暮らしの場合: セキュリティ、生活動線、収納、単身向け設備、夜間の安全性を重視
+- ファミリーの場合: 通学・通勤、周辺の子育て環境、部屋数・動線、騒音、将来の住み替えを重視
 
-【出力JSONフォーマット】（※必ずこのJSONのみを出力してください）
+【共通ルール：アクションプラン必須】
+PRO機能②③④の各テキストには、必ず次を含めてください。
+1) 根拠・可能性（推定で可）
+2) ユーザーがどう考えるべきか
+3) 具体的な行動（内見・交渉・撮影・見送り・追加確認など）
+単なるデータ解説だけで終わらせないこと。
+
+【PRO機能②：現地内見の絶対確認チェックリスト】
+viewingChecklist は抽象表現禁止。必ず
+「（リスク/可能性）のため、内見時は（具体的なチェックや撮影行動）を行う」形式で5〜8項目。
+
+【PRO機能③：価格・家賃の履歴トラッキング】
+priceHistoryReport を出力。
+${
+  isRental
+    ? `賃貸向け: 空室期間・家賃値下げ履歴（推定可）と交渉アドバイスを含める。
+例: 「空室が長引いている可能性が高いため、初期費用減額や家賃△円前後の交渉を検討。内見後に管理会社へ根拠を伝えて指値する。」`
+    : `分譲向け: 売れ残り期間・価格改定履歴（推定可）と指値アドバイスを含める。
+例: 「掲載長期化と値下げ履歴から、契約時に〇〇万円前後の指値余地あり。内見後に類似成約事例を根拠に交渉する。」`
+}
+
+【PRO機能④：将来予測レポート（5年後・10年後）】
+futureForecastReport を出力。
+${
+  isRental
+    ? `賃貸向け: 将来の周辺環境変化と家賃相場推移予測、更新時の判断アクションを含める。`
+    : `分譲向け: 10年後の想定リセールバリューと資産価値推移、保有/売却判断のアクションを含める。`
+}
+
+必ず以下のJSONフォーマットのみで出力してください。
+
 {
-  "score": 85,
-  "summary": "物件の全体像、コスパ、総合的なおすすめ度を解説した概要文章（200〜300文字程度）",
-  "pros": [
-    "おすすめポイント1（具体的な理由やメリット）",
-    "おすすめポイント2",
-    "おすすめポイント3"
-  ],
-  "cons": [
-    "懸念点・リスク1（注意すべき理由や対策）",
-    "懸念点・リスク2",
-    "懸念点・リスク3"
-  ],
+  "score": 0〜100の数値 (例: 78),
+  "summary": "全体の総評 (100〜150文字程度)",
+  "pros": ["メリット1", "メリット2", "メリット3"],
+  "cons": ["デメリット・注意点1", "デメリット・注意点2", "デメリット・注意点3"],
   "details": {
-    "priceEvaluation": "周辺相場との比較、家賃・管理費・初期費用の適正感についての解説",
-    "locationEvaluation": "駅徒歩、周辺の買い出し・治安・生活利便性、日当たりや周辺環境のリスク評価",
-    "layoutEvaluation": "間取りの使い勝手、生活動線、収納量、構造による防音性・耐震性の評価"
+    "priceEvaluation": "価格・家賃の妥当性に関する詳細分析",
+    "locationEvaluation": "立地・周辺環境・交通の便に関する詳細分析",
+    "layoutEvaluation": "間取り・設備・住み心地に関する詳細分析"
   },
   "viewingChecklist": [
-    "【場所/項目】内見時に現地で確認すべき具体的なチェックポイント1",
-    "【場所/項目】内見時に現地で確認すべき具体的なチェックポイント2",
-    "【場所/項目】内見時に現地で確認すべき具体的なチェックポイント3",
-    "【場所/項目】内見時に現地で確認すべき具体的なチェックポイント4",
-    "【場所/項目】内見時に現地で確認すべき具体的なチェックポイント5"
+    "リスク理由 + 内見時の具体チェック/撮影行動1",
+    "リスク理由 + 内見時の具体チェック/撮影行動2",
+    "リスク理由 + 内見時の具体チェック/撮影行動3",
+    "リスク理由 + 内見時の具体チェック/撮影行動4",
+    "リスク理由 + 内見時の具体チェック/撮影行動5"
+  ],
+  "priceHistoryReport": [
+    "履歴の示唆 + どう考えるべきか + 交渉/指値アクション1",
+    "履歴の示唆 + どう考えるべきか + 交渉/指値アクション2",
+    "履歴の示唆 + どう考えるべきか + 交渉/指値アクション3"
+  ],
+  "futureForecastReport": [
+    "5年後予測 + どう考えるべきか + 具体アクション1",
+    "10年後予測 + どう考えるべきか + 具体アクション2",
+    "総合判断 + どう考えるべきか + 具体アクション3"
   ]
 }
 
-以下が入力された物件情報です：
-${text ? `【テキスト情報】:\n${text}\n` : ''}
-${images && images.length > 0 ? `【画像添付あり】: 送信された画像・間取り図も総合的に判断してください。` : ''}
+【入力された物件テキスト】
+${text || 'なし'}
 `;
 
-    const contents: any[] = [{ text: prompt }];
+    const imageParts =
+      Array.isArray(images) && images.length > 0
+        ? images.filter(
+            (img: unknown): img is { inlineData: { mimeType: string; data: string } } =>
+              !!img &&
+              typeof img === 'object' &&
+              'inlineData' in img &&
+              typeof (img as { inlineData?: { mimeType?: string; data?: string } }).inlineData
+                ?.mimeType === 'string' &&
+              typeof (img as { inlineData?: { mimeType?: string; data?: string } }).inlineData
+                ?.data === 'string'
+          )
+        : [];
 
-    if (images && images.length > 0) {
-      images.forEach((img: { inlineData: { mimeType: string; data: string } }) => {
-        contents.push({
-          inlineData: {
-            mimeType: img.inlineData.mimeType,
-            data: img.inlineData.data,
-          },
-        });
-      });
-    }
-
-    const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
-      contents: contents,
-      config: {
+    const responseText = await generateGeminiContentWithFallback(GEMINI_ANALYZE_MODELS, {
+      prompt,
+      images: imageParts,
+      generationConfig: {
         responseMimeType: 'application/json',
       },
     });
 
-    const responseText = response.text;
-    if (!responseText) {
-      throw new Error('AIからの応答が空でした。');
+    const parsedData = JSON.parse(responseText);
+
+    // 旧フィールド互換: marketForecastReport しか無い場合は将来予測へ寄せる
+    if (!parsedData.futureForecastReport && Array.isArray(parsedData.marketForecastReport)) {
+      parsedData.futureForecastReport = parsedData.marketForecastReport;
+    }
+    if (!parsedData.priceHistoryReport && Array.isArray(parsedData.marketForecastReport)) {
+      parsedData.priceHistoryReport = parsedData.marketForecastReport.slice(0, 2);
     }
 
-    const cleanedText = responseText.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
-    const parsedData = JSON.parse(cleanedText);
-
     return NextResponse.json(parsedData);
-  } catch (error: any) {
-    console.error('Analysis error:', error);
-    return NextResponse.json(
-      { error: error.message || '解析処理中にエラーが発生しました。' },
-      { status: 500 }
-    );
+  } catch (error: unknown) {
+    console.error('API Error:', error);
+    const message = error instanceof Error ? error.message : '分析処理中にエラーが発生しました。';
+    let status = 500;
+    if (/quota|429|resource.?exhausted|rate.?limit/i.test(message)) status = 429;
+    else if (/404|not found|is not found/i.test(message)) status = 404;
+    else if (/timeout|timed?\s*out|deadline/i.test(message)) status = 504;
+    return NextResponse.json({ error: message }, { status });
   }
 }

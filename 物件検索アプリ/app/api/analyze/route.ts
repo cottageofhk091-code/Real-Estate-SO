@@ -5,7 +5,7 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 export const maxDuration = 60;
 
-const MODEL = "gemini-3.6-flash";
+const MODEL = "gemini-2.5-flash";
 const GEMINI_TIMEOUT_MS = 45_000;
 const MAX_RETRIES = 2;
 const MIN_TEXT_LENGTH = 10;

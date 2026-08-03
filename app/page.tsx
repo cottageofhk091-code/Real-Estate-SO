@@ -1,6 +1,21 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useEffect, useRef, type CSSProperties, type FormEvent, type ChangeEvent } from 'react';
+import {
+  type AnalysisSnapshot,
+  type AppUser,
+  type UserPlan,
+  VIEW_PURCHASED_QUERY,
+  addPurchasedPropertyRecord,
+  buildPropertyId,
+  canAccessProFeatures,
+  ensureDevDummyPurchases,
+  extractLocationOrUrl,
+  extractPropertyTitle,
+  mergeServerEntitlements,
+  readUserState,
+  writeUserState,
+} from '@/lib/plan';
 
 interface AnalysisResult {
   score: number;
@@ -13,6 +28,224 @@ interface AnalysisResult {
     layoutEvaluation: string;
   };
   viewingChecklist: string[];
+  priceHistoryReport?: string[];
+  futureForecastReport?: string[];
+  /** @deprecated 互換用 */
+  marketForecastReport?: string[];
+}
+
+const LOADING_STEPS = [
+  '物件情報を読み込み中...',
+  '周辺相場とリスクを照合中...',
+  '間取り・生活動線・採光を分析中...',
+  '潜むデメリットをチェック中...',
+  'PRO分析（内見・履歴・将来予測）を作成中...',
+];
+const LOADING_STEP_INTERVAL_MS = 3500;
+const PROGRESS_DURATION_MS = 60000;
+const FORM_INPUT_HINT =
+  '💡 情報（賃料、共益費、駅徒歩、設備、気になっている点など）が多ければ多いほど、AIがより詳細で精度の高い分析を行います。';
+const INPUT_TEXT_MAX_LENGTH = 3000;
+const INPUT_TEXT_WARN_LENGTH = 2800;
+const FREE_TRIAL_LIMIT = 3;
+const FREE_TRIAL_STORAGE_KEY = 'bukken_ai_free_trials_remaining';
+const SERVICE_DISCLAIMER =
+  '⚠️ 免責事項：本サービスの分析・回答はAIによる推計であり、物件の契約や価値を保証するものではありません。最終的な契約・判断は必ずご自身の責任において、信頼できる不動産会社等にご確認のうえ行ってください。';
+const API_FALLBACK_MESSAGE =
+  '現在アクセスが集中しているか、一時的なエラーが発生しました。お手数ですが、もう一度お試しいただくか、サポートまでご連絡ください。';
+const ANALYZE_TIMEOUT_MS = 90_000;
+const CHAT_TIMEOUT_MS = 60_000;
+
+type ModalType = 'terms' | 'privacy' | 'contact' | 'paywall' | 'agreement' | 'tokushoho' | 'auth' | null;
+type PayPlan = 'ticket' | 'pro';
+type PropertyType = 'rental' | 'purchase';
+type HouseholdType = 'single' | 'family';
+type ChatMessage = { role: 'user' | 'model'; text: string };
+
+const PRO_FEATURES_BASE = [
+  {
+    icon: '💬',
+    title: '【PRO機能①】専属AIアドバイザーと本音チャット相談',
+    body: '物件データを前提に、結論→根拠→具体アドバイスまでフランクな本音で直言します。',
+  },
+  {
+    icon: '📋',
+    title: '【PRO機能②】現地内見の絶対確認チェックリスト',
+    body: '現地で測る・撮る・確認する具体ポイントと撮影指示で、見落とし失敗を防ぎます。',
+  },
+] as const;
+
+const PRO_FEATURE3_BY_TYPE: Record<PropertyType, { icon: string; title: string; body: string }> = {
+  rental: {
+    icon: '📊',
+    title: '【PRO機能③】価格・家賃の履歴トラッキング',
+    body: '空室期間・家賃値下げ履歴から交渉余地を可視化し、指値の根拠と行動手順を提示します。',
+  },
+  purchase: {
+    icon: '📊',
+    title: '【PRO機能③】価格・家賃の履歴トラッキング',
+    body: '売れ残り期間・価格改定履歴から指値余地を可視化し、交渉の根拠と行動手順を提示します。',
+  },
+};
+
+const PRO_FEATURE4_BY_TYPE: Record<PropertyType, { icon: string; title: string; body: string }> = {
+  rental: {
+    icon: '🔮',
+    title: '【PRO機能④】将来予測レポート（5年後・10年後）',
+    body: '将来の周辺環境変化と家賃相場推移を予測し、更新・住み替え判断のアクションを示します。',
+  },
+  purchase: {
+    icon: '🔮',
+    title: '【PRO機能④】将来予測レポート（5年後・10年後）',
+    body: '10年後の想定リセールバリューと資産価値推移を予測し、保有/売却判断のアクションを示します。',
+  },
+};
+
+const DEFAULT_PRICE_HISTORY_PREVIEW: Record<PropertyType, string[]> = {
+  rental: [
+    '空室が長期化している可能性が高いため、初期費用減額や家賃数千円単位の交渉余地を検討。内見後に管理会社へ根拠を伝えて指値する。',
+    '直近の家賃値下げ履歴が見られる場合、追加の値引きより更新料・礼金の減額交渉が通りやすい。見積書の内訳を確認してから提案する。',
+    '同エリア類似物件比で割高なら、条件変更が難しい場合は見送り候補に。比較表を作って判断基準を明確にする。',
+  ],
+  purchase: [
+    '掲載長期化・値下げ履歴がある場合、契約時に価格の指値余地が高い。内見後に類似成約事例を根拠に交渉する。',
+    '値下げ幅が小さい場合は価格以外（修繕・設備）の条件交渉を優先。ホームインスペクション実施を条件に付ける。',
+    '周辺成約が弱い場合は焦らず追加内見を。指値根拠が揃うまで申込を保留する判断も有効。',
+  ],
+};
+
+const DEFAULT_FUTURE_FORECAST_PREVIEW: Record<PropertyType, string[]> = {
+  rental: [
+    '5年後の家賃相場は横ばい〜緩やか変動が想定されるため、更新時の値上げ提示に備え、更新料・家賃改定条項を契約前に確認する。',
+    '周辺再開発があれば住みやすさ向上の一方で騒音・混雑リスクも。内見時に工事掲示と動線を撮影して判断材料にする。',
+    '10年スパンで住み替える想定なら、退去費用と更新コストを試算し、3年目更新の可否を先に決めておく。',
+  ],
+  purchase: [
+    '5年後は流動性が重要。管理状態と修繕積立の健全性を確認し、資産性の低い間取りは避ける判断が有効。',
+    '10年後の想定リセールは立地次第で差が出る。駅距離・学区・再開発を優先条件に置き直して比較する。',
+    '将来の維持費上昇が見込まれるため、購入前に管理組合資料を取り寄せ、固定費込みの実質負担で判断する。',
+  ],
+};
+
+const COLORS = {
+  pageBg: '#f8fafc',
+  pageBgDeep: '#f1f5f9',
+  card: '#ffffff',
+  cardAlt: '#f8fafc',
+  elevated: '#e2e8f0',
+  border: '#e2e8f0',
+  borderBright: '#cbd5e1',
+  text: '#0f172a',
+  textMuted: '#475569',
+  textDim: '#64748b',
+  accent: '#2563eb',
+  accentStrong: '#4f46e5',
+  purple: '#4f46e5',
+  scoreBg: 'rgba(37, 99, 235, 0.08)',
+  cardShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.05), 0 2px 4px -2px rgba(0, 0, 0, 0.05)',
+};
+
+const IS_DEV = process.env.NODE_ENV === 'development';
+
+function isAbortError(err: unknown): boolean {
+  if (err instanceof DOMException && err.name === 'AbortError') return true;
+  if (err instanceof Error && err.name === 'AbortError') return true;
+  return false;
+}
+
+function isRetryableApiFailure(status: number, rawMessage: string): boolean {
+  if ([408, 404, 429, 500, 502, 503, 504].includes(status)) return true;
+  return /quota|rate.?limit|timeout|timed?\s*out|econnreset|fetch failed|network|404|not found|resource.?exhausted|overloaded|unavailable/i.test(
+    rawMessage
+  );
+}
+
+function DisclaimerNotice({ compact = false }: { compact?: boolean }) {
+  return (
+    <p
+      style={{
+        margin: 0,
+        fontSize: compact ? '11px' : '12px',
+        lineHeight: 1.7,
+        color: COLORS.textDim,
+        textAlign: 'left',
+        backgroundColor: '#fffbeb',
+        border: '1px solid #fde68a',
+        borderRadius: '10px',
+        padding: compact ? '10px 12px' : '12px 14px',
+      }}
+    >
+      {SERVICE_DISCLAIMER}
+    </p>
+  );
+}
+
+function ApiErrorPanel({
+  message,
+  onRetry,
+  onContact,
+  retryDisabled = false,
+}: {
+  message: string;
+  onRetry: () => void;
+  onContact?: () => void;
+  retryDisabled?: boolean;
+}) {
+  return (
+    <div
+      role="alert"
+      style={{
+        marginTop: '16px',
+        marginBottom: '10px',
+        padding: '14px 16px',
+        backgroundColor: '#fef2f2',
+        border: '1px solid #fecaca',
+        color: '#991b1b',
+        fontSize: '14px',
+        borderRadius: '12px',
+        lineHeight: 1.7,
+      }}
+    >
+      <p style={{ margin: '0 0 12px 0' }}>⚠️ {message}</p>
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px' }}>
+        <button
+          type="button"
+          onClick={onRetry}
+          disabled={retryDisabled}
+          style={{
+            background: retryDisabled ? '#94a3b8' : 'linear-gradient(to right, #4f46e5, #2563eb)',
+            color: '#ffffff',
+            border: 'none',
+            borderRadius: '8px',
+            padding: '8px 14px',
+            fontWeight: 800,
+            fontSize: '13px',
+            cursor: retryDisabled ? 'not-allowed' : 'pointer',
+          }}
+        >
+          🔄 再試行する
+        </button>
+        {onContact && (
+          <button
+            type="button"
+            onClick={onContact}
+            style={{
+              background: '#ffffff',
+              color: '#b91c1c',
+              border: '1px solid #fecaca',
+              borderRadius: '8px',
+              padding: '8px 14px',
+              fontWeight: 700,
+              fontSize: '13px',
+              cursor: 'pointer',
+            }}
+          >
+            サポートへ連絡
+          </button>
+        )}
+      </div>
+    </div>
+  );
 }
 
 export default function Home() {
@@ -20,10 +253,452 @@ export default function Home() {
   const [images, setImages] = useState<{ inlineData: { mimeType: string; data: string } }[]>([]);
   const [imagePreviews, setImagePreviews] = useState<string[]>([]);
   const [loading, setLoading] = useState(false);
+  const [loadingStepIndex, setLoadingStepIndex] = useState(0);
+  const [progressPercent, setProgressPercent] = useState(0);
   const [result, setResult] = useState<AnalysisResult | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [errorRetryable, setErrorRetryable] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const [propertyType, setPropertyType] = useState<PropertyType>('rental');
+  const [householdType, setHouseholdType] = useState<HouseholdType>('single');
 
-  const handleImageUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+  // 無料診断回数（PROコンテンツのお試し解放枠）
+  const [freeTrialsLeft, setFreeTrialsLeft] = useState(FREE_TRIAL_LIMIT);
+  // 無料枠で今回の診断結果を解放したか（月額・単発購入とは別）
+  const [freeTrialUnlockedForResult, setFreeTrialUnlockedForResult] = useState(false);
+  // userId / plan / purchasedProperties
+  const [user, setUser] = useState<AppUser>({
+    userId: 'user_guest',
+    email: null,
+    isLoggedIn: false,
+    authProvider: null,
+    plan: 'FREE',
+    purchasedProperties: [],
+    stripeCustomerId: null,
+  });
+  const [currentPropertyId, setCurrentPropertyId] = useState<string | null>(null);
+  const [authEmail, setAuthEmail] = useState('');
+  const [authSubmitting, setAuthSubmitting] = useState(false);
+  const [pendingPayPlan, setPendingPayPlan] = useState<PayPlan | null>(null);
+  /** authモーダルの用途: ヘッダーからのログイン or 決済前認証 */
+  const [authIntent, setAuthIntent] = useState<'login' | 'paywall'>('login');
+
+  // PROチャット
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
+  const [chatInput, setChatInput] = useState('');
+  const [chatLoading, setChatLoading] = useState(false);
+  const [chatError, setChatError] = useState<string | null>(null);
+  const [chatErrorRetryable, setChatErrorRetryable] = useState(false);
+
+  // モーダル状態管理
+  const [activeModal, setActiveModal] = useState<ModalType>(null);
+  const [contactSubmitted, setContactSubmitted] = useState(false);
+  const [contactSubmitting, setContactSubmitting] = useState(false);
+  const [contactError, setContactError] = useState<string | null>(null);
+
+  // Paywall（クレジットカード / Stripe Checkout）
+  const [selectedPlan, setSelectedPlan] = useState<PayPlan>('pro');
+  const [paywallEmail, setPaywallEmail] = useState('');
+  const [paywallSubmitting, setPaywallSubmitting] = useState(false);
+  const [paywallMessage, setPaywallMessage] = useState<string | null>(null);
+  const analyzeAbortRef = useRef<AbortController | null>(null);
+  const analyzeTimedOutRef = useRef(false);
+  const chatAbortRef = useRef<AbortController | null>(null);
+  const chatTimedOutRef = useRef(false);
+  const lastChatPayloadRef = useRef<{
+    message: string;
+    historyBeforeSend: ChatMessage[];
+  } | null>(null);
+
+  // LocalStorage から無料回数・ユーザー状態を復元
+  useEffect(() => {
+    try {
+      const stored = localStorage.getItem(FREE_TRIAL_STORAGE_KEY);
+      if (stored === null) {
+        localStorage.setItem(FREE_TRIAL_STORAGE_KEY, String(FREE_TRIAL_LIMIT));
+        setFreeTrialsLeft(FREE_TRIAL_LIMIT);
+      } else {
+        const parsed = Number.parseInt(stored, 10);
+        setFreeTrialsLeft(Number.isFinite(parsed) ? Math.max(0, Math.min(FREE_TRIAL_LIMIT, parsed)) : FREE_TRIAL_LIMIT);
+      }
+    } catch {
+      setFreeTrialsLeft(FREE_TRIAL_LIMIT);
+    }
+
+    let next = readUserState();
+    if (IS_DEV) {
+      next = ensureDevDummyPurchases(next);
+    }
+    setUser(next);
+    if (next.email) setPaywallEmail(next.email);
+
+    // サーバー entitlements 同期 + Checkout 戻り処理
+    void (async () => {
+      try {
+        const params = new URLSearchParams(window.location.search);
+        const checkout = params.get('checkout');
+        const sessionId = params.get('session_id');
+
+        if (checkout === 'success' && sessionId) {
+          const confirmRes = await fetch('/api/checkout/confirm', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ sessionId, userId: next.userId }),
+          });
+          const confirmData = await confirmRes.json();
+          if (confirmRes.ok) {
+            next = mergeServerEntitlements(next, confirmData);
+            // sessionStorage の診断コンテキストを購入レコードへ反映
+            try {
+              const rawCtx = sessionStorage.getItem('bukken_ai_checkout_context');
+              if (rawCtx) {
+                const ctx = JSON.parse(rawCtx) as {
+                  propertyId?: string;
+                  inputText?: string;
+                  householdType?: HouseholdType;
+                  propertyType?: PropertyType;
+                  cachedResult?: AnalysisResult | null;
+                };
+                if (ctx.propertyId) {
+                  next = {
+                    ...next,
+                    purchasedProperties: addPurchasedPropertyRecord(next.purchasedProperties, {
+                      propertyId: ctx.propertyId,
+                      title: extractPropertyTitle(ctx.inputText || ctx.propertyId),
+                      locationOrUrl: extractLocationOrUrl(ctx.inputText || ctx.propertyId),
+                      purchasedAt: new Date().toISOString(),
+                      householdType: ctx.householdType === 'family' ? 'family' : 'single',
+                      propertyType: ctx.propertyType === 'purchase' ? 'purchase' : 'rental',
+                      sourceText: ctx.inputText,
+                      cachedResult: (ctx.cachedResult as AnalysisSnapshot | null) || null,
+                    }),
+                  };
+                  setCurrentPropertyId(ctx.propertyId);
+                  if (ctx.inputText) setInputText(ctx.inputText);
+                  if (ctx.householdType) setHouseholdType(ctx.householdType);
+                  if (ctx.propertyType) setPropertyType(ctx.propertyType);
+                  if (ctx.cachedResult) {
+                    setResult(ctx.cachedResult);
+                    setFreeTrialUnlockedForResult(false);
+                  }
+                }
+                sessionStorage.removeItem('bukken_ai_checkout_context');
+              }
+            } catch {
+              // ignore
+            }
+            writeUserState(next);
+            setUser(next);
+            setPaywallMessage(
+              confirmData.planType === 'SINGLE'
+                ? '単発プランの決済が完了しました。この物件のPRO機能が解放されました。'
+                : '月額PROプランの登録が完了しました。全物件でPRO機能をご利用いただけます。'
+            );
+            setActiveModal('paywall');
+          } else {
+            setPaywallMessage(
+              confirmData.error ||
+                '決済の確認に失敗しました。反映まで数分かかる場合があります。マイページでご確認ください。'
+            );
+            setActiveModal('paywall');
+          }
+          window.history.replaceState({}, '', '/');
+        } else if (checkout === 'cancel') {
+          setPaywallMessage('決済がキャンセルされました。必要であれば再度お試しください。');
+          setActiveModal('paywall');
+          window.history.replaceState({}, '', '/');
+        }
+
+        const entRes = await fetch(`/api/entitlements?userId=${encodeURIComponent(next.userId)}`);
+        if (entRes.ok) {
+          const ent = await entRes.json();
+          if (ent.found) {
+            const merged = mergeServerEntitlements(next, ent);
+            writeUserState(merged);
+            setUser(merged);
+          }
+        }
+      } catch {
+        // ignore sync errors
+      }
+    })();
+
+    // マイページからの復元 / Paywall自動オープン
+    try {
+      const params = new URLSearchParams(window.location.search);
+      const purchasedId = params.get(VIEW_PURCHASED_QUERY);
+      const openPaywallFlag = params.get('openPaywall');
+      const openAuthFlag = params.get('openAuth');
+      const planParam = params.get('plan');
+
+      if (purchasedId) {
+        const record = next.purchasedProperties.find((p) => p.propertyId === purchasedId);
+        if (record) {
+          setCurrentPropertyId(record.propertyId);
+          if (record.sourceText) setInputText(record.sourceText);
+          if (record.householdType) setHouseholdType(record.householdType);
+          if (record.propertyType) setPropertyType(record.propertyType);
+          if (record.cachedResult) {
+            setResult(record.cachedResult as AnalysisResult);
+            setFreeTrialUnlockedForResult(false);
+          }
+        }
+      }
+
+      if (openPaywallFlag === '1') {
+        if (planParam === 'ticket') setSelectedPlan('ticket');
+        if (planParam === 'pro') setSelectedPlan('pro');
+        // ログイン済みならPaywall、未ログインなら認証へ
+        if (next.isLoggedIn) {
+          setActiveModal('paywall');
+        } else {
+          setPendingPayPlan(planParam === 'ticket' ? 'ticket' : 'pro');
+          setAuthIntent('paywall');
+          setActiveModal('auth');
+        }
+      } else if (openAuthFlag === '1' && !next.isLoggedIn) {
+        setAuthIntent('login');
+        setActiveModal('auth');
+      }
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  // ESCキーでモーダルを閉じる
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setActiveModal(null);
+        setPaywallMessage(null);
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, []);
+
+  // 解析中: パルス/リング + ステップコメント + プログレスバー
+  useEffect(() => {
+    if (!loading) return;
+    setLoadingStepIndex(0);
+    setProgressPercent(0);
+
+    const startTime = Date.now();
+    const tick = setInterval(() => {
+      const elapsed = Date.now() - startTime;
+      const t = Math.min(1, elapsed / PROGRESS_DURATION_MS);
+      setProgressPercent(Math.min(95, Math.floor(t * 95)));
+      setLoadingStepIndex(
+        Math.floor(elapsed / LOADING_STEP_INTERVAL_MS) % LOADING_STEPS.length
+      );
+    }, 100);
+
+    return () => clearInterval(tick);
+  }, [loading]);
+
+  const openAuthModal = (intent: 'login' | 'paywall' = 'login') => {
+    setAuthIntent(intent);
+    setAuthEmail('');
+    setAuthSubmitting(false);
+    setError(null);
+    setActiveModal('auth');
+  };
+
+  const persistUser = (next: AppUser) => {
+    setUser(next);
+    writeUserState(next);
+  };
+
+  const openPaywall = (plan?: PayPlan) => {
+    setPaywallMessage(null);
+    setPaywallSubmitting(false);
+    if (plan) setSelectedPlan(plan);
+
+    // 未ログイン時は決済前にアカウント登録/ログインを挟む
+    if (!user.isLoggedIn) {
+      setPendingPayPlan(plan || selectedPlan);
+      openAuthModal('paywall');
+      return;
+    }
+    setActiveModal('paywall');
+  };
+
+  const completeAuthAndContinue = (email: string, provider: 'google' | 'email') => {
+    const next: AppUser = {
+      ...user,
+      email,
+      isLoggedIn: true,
+      authProvider: provider,
+    };
+    persistUser(next);
+    setAuthSubmitting(false);
+    setAuthEmail('');
+    const intent = authIntent;
+    if (intent === 'paywall') {
+      if (pendingPayPlan) setSelectedPlan(pendingPayPlan);
+      setPendingPayPlan(null);
+      setActiveModal('paywall');
+      return;
+    }
+    setPendingPayPlan(null);
+    setActiveModal(null);
+  };
+
+  const handleLogout = () => {
+    const next: AppUser = {
+      ...user,
+      email: null,
+      isLoggedIn: false,
+      authProvider: null,
+      plan: 'FREE',
+    };
+    persistUser(next);
+    setActiveModal(null);
+    setPaywallMessage(null);
+  };
+
+  const applyDevLoginState = (loggedIn: boolean) => {
+    if (loggedIn) {
+      persistUser({
+        ...user,
+        isLoggedIn: true,
+        email: user.email || `dev_${user.userId.slice(-6)}@example.com`,
+        authProvider: user.authProvider || 'email',
+      });
+      return;
+    }
+    handleLogout();
+  };
+
+  const handleAuthEmailSubmit = (e: FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    const email = authEmail.trim();
+    if (!email || !email.includes('@')) {
+      setError('有効なメールアドレスを入力してください。');
+      return;
+    }
+    setAuthSubmitting(true);
+    setError(null);
+    // デモ: メール認証完了としてログイン状態にする
+    setTimeout(() => {
+      completeAuthAndContinue(email, 'email');
+    }, 500);
+  };
+
+  const handleAuthGoogle = () => {
+    setAuthSubmitting(true);
+    setError(null);
+    setTimeout(() => {
+      const demoEmail = `user_${user.userId.slice(-6)}@gmail.com`;
+      completeAuthAndContinue(demoEmail, 'google');
+    }, 500);
+  };
+
+  const updateUser = (patch: Partial<AppUser>) => {
+    persistUser({ ...user, ...patch });
+  };
+
+  const unlockFreeTrialForCurrent = () => {
+    setFreeTrialUnlockedForResult(true);
+  };
+
+  const consumeFreeTrial = () => {
+    setFreeTrialsLeft((prev) => {
+      const next = Math.max(0, prev - 1);
+      try {
+        localStorage.setItem(FREE_TRIAL_STORAGE_KEY, String(next));
+      } catch {
+        // ignore storage errors
+      }
+      return next;
+    });
+  };
+
+  const resetFreeTrialsForDev = () => {
+    if (!IS_DEV) return;
+    try {
+      localStorage.setItem(FREE_TRIAL_STORAGE_KEY, String(FREE_TRIAL_LIMIT));
+    } catch {
+      // ignore storage errors
+    }
+    setFreeTrialsLeft(FREE_TRIAL_LIMIT);
+    setError(null);
+  };
+
+  const openStripeCustomerPortal = async () => {
+    setPaywallSubmitting(true);
+    setPaywallMessage(null);
+    try {
+      const res = await fetch('/api/create-portal-session', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: user.userId,
+          stripeCustomerId: user.stripeCustomerId,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.url) {
+        throw new Error(data.error || '契約管理ページを開けませんでした。');
+      }
+      window.location.href = data.url as string;
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : '契約管理ページの表示に失敗しました。';
+      setPaywallMessage(message);
+      setPaywallSubmitting(false);
+    }
+  };
+
+  const cancelSubscriptionToFree = () => {
+    void openStripeCustomerPortal();
+  };
+
+  /** DEV: 月額 / 無料へ切替（FREE時は購入履歴もクリアして初期化） */
+  const applyDevPlan = (plan: UserPlan) => {
+    if (!IS_DEV) return;
+    if (plan === 'MONTHLY') {
+      updateUser({ plan: 'MONTHLY' });
+      setPaywallMessage(null);
+      return;
+    }
+    persistUser({
+      ...user,
+      plan: 'FREE',
+      purchasedProperties: [],
+    });
+    setFreeTrialUnlockedForResult(false);
+    setPaywallMessage(null);
+  };
+
+  /** DEV: 現在の物件を purchasedProperties に追加して即座にモザイク解除 */
+  const purchaseCurrentPropertyForDev = () => {
+    if (!IS_DEV) return;
+    const propertyId =
+      currentPropertyId ||
+      (inputText.trim() ? buildPropertyId(inputText) : null);
+
+    if (!propertyId || propertyId === 'prop_empty') {
+      setError('物件テキストを入力するか、先に解析してから購入テストしてください。');
+      return;
+    }
+
+    setCurrentPropertyId(propertyId);
+    setError(null);
+    updateUser({
+      purchasedProperties: addPurchasedPropertyRecord(user.purchasedProperties, {
+        propertyId,
+        title: extractPropertyTitle(inputText || propertyId),
+        locationOrUrl: extractLocationOrUrl(inputText || propertyId),
+        purchasedAt: new Date().toISOString(),
+        householdType,
+        propertyType,
+        sourceText: inputText || undefined,
+        cachedResult: (result as AnalysisSnapshot | null) || null,
+      }),
+    });
+  };
+
+  const handleImageUpload = (e: ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files;
     if (!files) return;
 
@@ -39,209 +714,1144 @@ export default function Home() {
       };
       reader.readAsDataURL(file);
     });
+    e.target.value = '';
+  };
+
+  const handleRemoveImage = (index: number) => {
+    setImages((prev) => prev.filter((_, i) => i !== index));
+    setImagePreviews((prev) => prev.filter((_, i) => i !== index));
+  };
+
+  const handleReset = () => {
+    setInputText('');
+    setImages([]);
+    setImagePreviews([]);
+    setResult(null);
+    setError(null);
+    setErrorRetryable(false);
+    setCurrentPropertyId(null);
+    setFreeTrialUnlockedForResult(false);
+    setChatMessages([]);
+    setChatInput('');
+    setChatError(null);
+    setChatErrorRetryable(false);
+    lastChatPayloadRef.current = null;
+  };
+
+  const handleCopyResult = () => {
+    if (!result) return;
+    const copyText = `
+【物件セカンドオピニオン AI 査定結果】
+■ 総合スコア: ${result.score} / 100
+■ 概要: ${result.summary}
+
+【👍 メリット】
+${result.pros.map((p) => `・${p}`).join('\n')}
+
+【⚠️ リスク・注意点】
+${result.cons.map((c) => `・${c}`).join('\n')}
+
+【詳細分析】
+・価格妥当性: ${result.details.priceEvaluation}
+・立地・環境: ${result.details.locationEvaluation}
+・間取り・設備: ${result.details.layoutEvaluation}
+
+【📋 現地内見チェックリスト】
+${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
+    `.trim();
+
+    navigator.clipboard.writeText(copyText).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    });
+  };
+
+  const handleCancelAnalyze = () => {
+    analyzeTimedOutRef.current = false;
+    analyzeAbortRef.current?.abort();
+    analyzeAbortRef.current = null;
+    setLoading(false);
+    setLoadingStepIndex(0);
+    setProgressPercent(0);
+    setError(null);
+    setErrorRetryable(false);
   };
 
   const handleAnalyze = async () => {
     if (!inputText && images.length === 0) {
       setError('物件概要（テキスト）または画像を入力してください。');
+      setErrorRetryable(false);
       return;
     }
 
+    if (inputText.length > INPUT_TEXT_MAX_LENGTH) {
+      setError('入力テキストが長すぎます。3,000文字以内に収めてください。');
+      setErrorRetryable(false);
+      return;
+    }
+
+    analyzeAbortRef.current?.abort();
+    const controller = new AbortController();
+    analyzeAbortRef.current = controller;
+    analyzeTimedOutRef.current = false;
+    const timeoutId = window.setTimeout(() => {
+      analyzeTimedOutRef.current = true;
+      controller.abort();
+    }, ANALYZE_TIMEOUT_MS);
+
     setLoading(true);
     setError(null);
+    setErrorRetryable(false);
     setResult(null);
+    setChatMessages([]);
+    setChatInput('');
+    setChatError(null);
+    setChatErrorRetryable(false);
+
+    const propertyId = buildPropertyId(inputText);
+    setCurrentPropertyId(propertyId);
+
+    const isMonthly = user.plan === 'MONTHLY';
+    const isPurchased = user.purchasedProperties.some((p) => p.propertyId === propertyId);
+    const hasFreeTrial = freeTrialsLeft > 0;
+    // 月額 / 単発購入済み / 無料お試し枠
+    const entitledBySubscriptionOrPurchase = isMonthly || isPurchased;
+    const entitledByFreeTrial = !entitledBySubscriptionOrPurchase && hasFreeTrial;
 
     try {
       const res = await fetch('/api/analyze', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text: inputText, images }),
+        signal: controller.signal,
+        body: JSON.stringify({
+          text: inputText,
+          images,
+          propertyType,
+          householdType,
+        }),
+      });
+
+      let data: (AnalysisResult & { error?: string }) | null = null;
+      try {
+        data = (await res.json()) as AnalysisResult & { error?: string };
+      } catch {
+        throw Object.assign(new Error(API_FALLBACK_MESSAGE), { retryable: true });
+      }
+
+      if (!res.ok) {
+        const raw = typeof data?.error === 'string' ? data.error : `解析に失敗しました（${res.status}）`;
+        if (isRetryableApiFailure(res.status, raw)) {
+          throw Object.assign(new Error(API_FALLBACK_MESSAGE), { retryable: true });
+        }
+        throw Object.assign(new Error(raw), { retryable: false });
+      }
+
+      if (!data || typeof data.score !== 'number') {
+        throw Object.assign(new Error(API_FALLBACK_MESSAGE), { retryable: true });
+      }
+
+      setProgressPercent(100);
+      setResult(data);
+      setFreeTrialUnlockedForResult(entitledByFreeTrial);
+      if (entitledByFreeTrial) {
+        consumeFreeTrial();
+      }
+    } catch (err: unknown) {
+      if (isAbortError(err)) {
+        if (analyzeTimedOutRef.current) {
+          setError(API_FALLBACK_MESSAGE);
+          setErrorRetryable(true);
+          setFreeTrialUnlockedForResult(false);
+        }
+        return;
+      }
+      const retryable =
+        typeof err === 'object' && err !== null && 'retryable' in err
+          ? Boolean((err as { retryable?: boolean }).retryable)
+          : true;
+      const message = err instanceof Error && err.message ? err.message : API_FALLBACK_MESSAGE;
+      const isNetworkLike =
+        /failed to fetch|networkerror|load failed|network/i.test(message) ||
+        message === 'Failed to fetch';
+      setError(isNetworkLike || retryable ? API_FALLBACK_MESSAGE : message);
+      setErrorRetryable(retryable || isNetworkLike);
+      setFreeTrialUnlockedForResult(false);
+    } finally {
+      window.clearTimeout(timeoutId);
+      if (analyzeAbortRef.current === controller) {
+        analyzeAbortRef.current = null;
+      }
+      setLoading(false);
+    }
+  };
+
+  const sendChatMessage = async (message: string, historyBeforeSend: ChatMessage[]) => {
+    if (!result || isProContentLocked) {
+      openPaywall();
+      return;
+    }
+
+    chatAbortRef.current?.abort();
+    const controller = new AbortController();
+    chatAbortRef.current = controller;
+    chatTimedOutRef.current = false;
+    const timeoutId = window.setTimeout(() => {
+      chatTimedOutRef.current = true;
+      controller.abort();
+    }, CHAT_TIMEOUT_MS);
+
+    lastChatPayloadRef.current = { message, historyBeforeSend };
+    setChatLoading(true);
+    setChatError(null);
+    setChatErrorRetryable(false);
+
+    try {
+      const res = await fetch('/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal,
+        body: JSON.stringify({
+          propertyInfo: inputText,
+          previousAnalysis: result,
+          messageHistory: historyBeforeSend,
+          newMessage: message,
+          propertyType,
+          householdType,
+        }),
+      });
+
+      let data: { reply?: string; error?: string } | null = null;
+      try {
+        data = (await res.json()) as { reply?: string; error?: string };
+      } catch {
+        throw Object.assign(new Error(API_FALLBACK_MESSAGE), { retryable: true });
+      }
+
+      if (!res.ok) {
+        const raw = typeof data?.error === 'string' ? data.error : `チャット応答の取得に失敗しました（${res.status}）`;
+        if (isRetryableApiFailure(res.status, raw)) {
+          throw Object.assign(new Error(API_FALLBACK_MESSAGE), { retryable: true });
+        }
+        throw Object.assign(new Error(raw), { retryable: false });
+      }
+
+      setChatMessages((prev) => [
+        ...prev,
+        { role: 'model', text: data?.reply || '回答を取得できませんでした。' },
+      ]);
+      lastChatPayloadRef.current = null;
+    } catch (err: unknown) {
+      if (isAbortError(err)) {
+        if (chatTimedOutRef.current) {
+          setChatError(API_FALLBACK_MESSAGE);
+          setChatErrorRetryable(true);
+        }
+        return;
+      }
+      const retryable =
+        typeof err === 'object' && err !== null && 'retryable' in err
+          ? Boolean((err as { retryable?: boolean }).retryable)
+          : true;
+      const messageText = err instanceof Error && err.message ? err.message : API_FALLBACK_MESSAGE;
+      const isNetworkLike =
+        /failed to fetch|networkerror|load failed|network/i.test(messageText) ||
+        messageText === 'Failed to fetch';
+      setChatError(isNetworkLike || retryable ? API_FALLBACK_MESSAGE : messageText);
+      setChatErrorRetryable(retryable || isNetworkLike);
+    } finally {
+      window.clearTimeout(timeoutId);
+      if (chatAbortRef.current === controller) {
+        chatAbortRef.current = null;
+      }
+      setChatLoading(false);
+    }
+  };
+
+  const handleChatSubmit = async (e: FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    if (!result || isProContentLocked) {
+      openPaywall();
+      return;
+    }
+
+    const message = chatInput.trim();
+    if (!message || chatLoading) return;
+
+    const historyBeforeSend = chatMessages;
+    setChatMessages([...historyBeforeSend, { role: 'user', text: message }]);
+    setChatInput('');
+    await sendChatMessage(message, historyBeforeSend);
+  };
+
+  const handleChatRetry = async () => {
+    const payload = lastChatPayloadRef.current;
+    if (!payload || chatLoading) return;
+    await sendChatMessage(payload.message, payload.historyBeforeSend);
+  };
+
+  const handleContactSubmit = async (e: FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    setContactError(null);
+    setContactSubmitting(true);
+
+    const form = e.currentTarget;
+    const formData = new FormData(form);
+    const payload = {
+      name: String(formData.get('name') || '').trim(),
+      email: String(formData.get('email') || '').trim(),
+      type: String(formData.get('type') || '').trim(),
+      message: String(formData.get('message') || '').trim(),
+    };
+
+    try {
+      const res = await fetch('/api/contact', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
       });
 
       const data = await res.json();
 
       if (!res.ok) {
-        throw new Error(data.error || '解析に失敗しました。');
+        throw new Error(data.error || '送信に失敗しました。');
       }
 
-      setResult(data);
-    } catch (err: any) {
-      setError(err.message || '予期せぬエラーが発生しました。');
+      setContactSubmitted(true);
+      form.reset();
+      setTimeout(() => {
+        setContactSubmitted(false);
+        setContactError(null);
+        setActiveModal(null);
+      }, 2500);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : '予期せぬエラーが発生しました。';
+      setContactError(message);
     } finally {
-      setLoading(false);
+      setContactSubmitting(false);
     }
   };
 
+  const handlePaywallSubmit = async (e: FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    setPaywallSubmitting(true);
+    setPaywallMessage(null);
+
+    const propertyId =
+      currentPropertyId || (inputText.trim() ? buildPropertyId(inputText) : null);
+    if (propertyId) {
+      setCurrentPropertyId(propertyId);
+    }
+
+    const planType = selectedPlan === 'ticket' ? 'SINGLE' : 'MONTHLY';
+
+    if (planType === 'SINGLE' && (!propertyId || propertyId === 'prop_empty')) {
+      setPaywallMessage(
+        '単発プランでは物件テキストの入力（または解析）が必要です。物件情報を入力してから再度お試しください。'
+      );
+      setPaywallSubmitting(false);
+      return;
+    }
+
+    const email = paywallEmail.trim() || user.email || '';
+    if (!email || !email.includes('@')) {
+      setPaywallMessage('決済用のメールアドレスを入力してください。');
+      setPaywallSubmitting(false);
+      return;
+    }
+
+    try {
+      if (email !== user.email) {
+        persistUser({ ...user, email });
+      }
+
+      // 決済戻り後に診断結果を復元できるよう一時保存
+      try {
+        sessionStorage.setItem(
+          'bukken_ai_checkout_context',
+          JSON.stringify({
+            propertyId,
+            inputText,
+            householdType,
+            propertyType,
+            cachedResult: result,
+            planType,
+          })
+        );
+      } catch {
+        // ignore
+      }
+
+      const res = await fetch('/api/checkout', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          planType,
+          userId: user.userId,
+          propertyId: planType === 'SINGLE' ? propertyId : undefined,
+          email,
+          propertySnapshot:
+            planType === 'SINGLE' && propertyId
+              ? {
+                  propertyId,
+                  title: extractPropertyTitle(inputText || propertyId),
+                  locationOrUrl: extractLocationOrUrl(inputText || propertyId),
+                  householdType,
+                  propertyType,
+                  sourceText: inputText || undefined,
+                }
+              : undefined,
+        }),
+      });
+
+      const data = await res.json();
+      if (!res.ok || !data.url) {
+        throw new Error(data.error || 'Checkout Session の作成に失敗しました。');
+      }
+
+      window.location.href = data.url as string;
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : '決済の開始に失敗しました。';
+      setPaywallMessage(message);
+      setPaywallSubmitting(false);
+    }
+  };
+
+  // 1) user.plan === MONTHLY → 全物件解放
+  // 2) purchasedProperties.includes(currentPropertyId) → 当該物件のみ解放
+  // 3) それ以外は無料枠解放（上限到達時はロック）
+  const isProUser = user.plan === 'MONTHLY';
+  const isCurrentPropertyPurchased =
+    !!currentPropertyId &&
+    user.purchasedProperties.some((p) => p.propertyId === currentPropertyId);
+  const isProContentLocked = !canAccessProFeatures({
+    user,
+    currentPropertyId,
+    freeTrialUnlockedForResult,
+  });
+
+  const planStatusLabel =
+    user.plan === 'MONTHLY'
+      ? `user.plan=MONTHLY / purchased=${user.purchasedProperties.length}`
+      : `user.plan=FREE / purchased=${user.purchasedProperties.length}`;
+
+  const proFeatures = [
+    ...PRO_FEATURES_BASE,
+    PRO_FEATURE3_BY_TYPE[propertyType],
+    PRO_FEATURE4_BY_TYPE[propertyType],
+  ];
+
+  const priceHistoryLines =
+    result?.priceHistoryReport && result.priceHistoryReport.length > 0
+      ? result.priceHistoryReport
+      : result?.marketForecastReport && result.marketForecastReport.length > 0
+        ? result.marketForecastReport.slice(0, 2)
+        : DEFAULT_PRICE_HISTORY_PREVIEW[propertyType];
+
+  const futureForecastLines =
+    result?.futureForecastReport && result.futureForecastReport.length > 0
+      ? result.futureForecastReport
+      : result?.marketForecastReport && result.marketForecastReport.length > 0
+        ? result.marketForecastReport
+        : DEFAULT_FUTURE_FORECAST_PREVIEW[propertyType];
+
+  const optionChipStyle = (active: boolean): CSSProperties => ({
+    flex: 1,
+    minWidth: '120px',
+    padding: '10px 12px',
+    borderRadius: '10px',
+    border: active ? '2px solid #2563eb' : `1px solid ${COLORS.border}`,
+    backgroundColor: active ? 'rgba(37, 99, 235, 0.06)' : COLORS.cardAlt,
+    color: COLORS.text,
+    fontWeight: active ? 800 : 600,
+    fontSize: '13px',
+    cursor: loading ? 'not-allowed' : 'pointer',
+    textAlign: 'center',
+  });
+
+  const trialBadgeStyle: CSSProperties = {
+    fontSize: '12px',
+    fontWeight: 700,
+    color: freeTrialsLeft > 0 ? COLORS.accent : '#dc2626',
+    backgroundColor: freeTrialsLeft > 0 ? 'rgba(37, 99, 235, 0.08)' : 'rgba(220, 38, 38, 0.08)',
+    padding: '6px 12px',
+    borderRadius: '999px',
+    border: `1px solid ${freeTrialsLeft > 0 ? 'rgba(37, 99, 235, 0.25)' : 'rgba(220, 38, 38, 0.25)'}`,
+    whiteSpace: 'nowrap',
+  };
+
+  const planCardStyle = (active: boolean): CSSProperties => ({
+    flex: 1,
+    textAlign: 'left',
+    padding: '14px 16px',
+    borderRadius: '12px',
+    cursor: 'pointer',
+    backgroundColor: active ? 'rgba(37, 99, 235, 0.06)' : COLORS.card,
+    border: active ? '2px solid #2563eb' : `1px solid ${COLORS.border}`,
+    color: COLORS.text,
+    boxShadow: active ? 'none' : COLORS.cardShadow,
+  });
+
+  const inputStyle: CSSProperties = {
+    width: '100%',
+    padding: '10px 14px',
+    borderRadius: '8px',
+    backgroundColor: COLORS.card,
+    border: `1px solid ${COLORS.border}`,
+    color: COLORS.text,
+    fontSize: '14px',
+    boxSizing: 'border-box',
+    outline: 'none',
+  };
+
+  const ProFeatureBlock = ({
+    title,
+    previewLines,
+    locked,
+  }: {
+    title: string;
+    previewLines: string[];
+    locked: boolean;
+  }) => (
+    <section
+      style={{
+        position: 'relative',
+        backgroundColor: COLORS.card,
+        border: `1px solid ${COLORS.border}`,
+        borderRadius: '16px',
+        padding: '28px',
+        overflow: 'hidden',
+        boxShadow: COLORS.cardShadow,
+        height: '100%',
+        boxSizing: 'border-box',
+      }}
+    >
+      {!locked && (
+        <div style={{ marginBottom: '12px' }}>
+          <span style={{ fontSize: '11px', fontWeight: 700, color: COLORS.accent, backgroundColor: 'rgba(37, 99, 235, 0.08)', padding: '4px 10px', borderRadius: '999px', border: '1px solid rgba(37, 99, 235, 0.2)' }}>
+            PRO限定・無料体験中
+          </span>
+        </div>
+      )}
+      <div
+        style={{
+          filter: locked ? 'blur(6px)' : 'none',
+          userSelect: locked ? 'none' : 'auto',
+          pointerEvents: locked ? 'none' : 'auto',
+        }}
+      >
+        <h3 style={{ fontSize: '18px', fontWeight: 'bold', color: COLORS.text, margin: '0 0 16px 0' }}>
+          {title}
+        </h3>
+        {previewLines.map((line, i) => (
+          <p key={i} style={{ fontSize: '14px', color: COLORS.textMuted, margin: '0 0 10px 0', lineHeight: 1.7 }}>
+            {line}
+          </p>
+        ))}
+      </div>
+      {locked && (
+        <div
+          style={{
+            position: 'absolute',
+            inset: 0,
+            display: 'flex',
+            flexDirection: 'column',
+            alignItems: 'center',
+            justifyContent: 'center',
+            background: 'linear-gradient(180deg, rgba(248,250,252,0.55) 0%, rgba(241,245,249,0.92) 100%)',
+            gap: '12px',
+            padding: '20px',
+            textAlign: 'center',
+          }}
+        >
+          <span style={{ fontSize: '28px' }}>🔒</span>
+          <p style={{ margin: 0, fontSize: '16px', fontWeight: 800, color: COLORS.text }}>
+            PRO登録で表示
+          </p>
+          <button
+            type="button"
+            onClick={() => openPaywall()}
+            style={{
+              background: 'linear-gradient(to right, #4f46e5, #2563eb)',
+              color: '#ffffff',
+              fontWeight: 800,
+              padding: '10px 22px',
+              borderRadius: '999px',
+              border: 'none',
+              cursor: 'pointer',
+              fontSize: '13px',
+              boxShadow: '0 8px 20px rgba(37, 99, 235, 0.25)',
+            }}
+          >
+            ロック解除する
+          </button>
+        </div>
+      )}
+    </section>
+  );
+
   return (
-    <div style={{ backgroundColor: '#0f172a', minHeight: '100vh', color: '#f8fafc', paddingBottom: '80px', fontFamily: '"Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif' }}>
-      
+    <div
+      style={{
+        background: `linear-gradient(180deg, ${COLORS.pageBg} 0%, ${COLORS.pageBgDeep} 100%)`,
+        minHeight: '100vh',
+        color: COLORS.text,
+        paddingBottom: '80px',
+        fontFamily: '"Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif',
+      }}
+    >
+
+      <style>{`
+        @keyframes pulse-ring {
+          0% { transform: scale(0.95); opacity: 0.8; }
+          50% { transform: scale(1.05); opacity: 0.4; }
+          100% { transform: scale(0.95); opacity: 0.8; }
+        }
+        @keyframes spin {
+          0% { transform: rotate(0deg); }
+          100% { transform: rotate(360deg); }
+        }
+        @keyframes modalFadeIn {
+          from { opacity: 0; transform: translateY(10px) scale(0.98); }
+          to { opacity: 1; transform: translateY(0) scale(1); }
+        }
+        @keyframes loadingStepFade {
+          from { opacity: 0; transform: translateY(6px); }
+          to { opacity: 1; transform: translateY(0); }
+        }
+        @keyframes progressShimmer {
+          0% { background-position: 100% 0; }
+          100% { background-position: -100% 0; }
+        }
+        .loading-ring { animation: spin 1.2s linear infinite; }
+        .pulse-container { animation: pulse-ring 2s ease-in-out infinite; }
+        .modal-animate { animation: modalFadeIn 0.2s cubic-bezier(0.16, 1, 0.3, 1) forwards; }
+        .loading-step-text { animation: loadingStepFade 0.5s ease forwards; }
+        .progress-bar-fill {
+          background: linear-gradient(90deg, #2563eb 0%, #4f46e5 45%, #60a5fa 55%, #4f46e5 100%);
+          background-size: 200% 100%;
+          animation: progressShimmer 1.4s linear infinite;
+        }
+
+        .pro-features-grid {
+          display: grid;
+          grid-template-columns: repeat(2, 1fr);
+          gap: 20px;
+          align-items: stretch;
+        }
+        @media (max-width: 768px) {
+          .pro-features-grid {
+            grid-template-columns: 1fr;
+          }
+        }
+
+        .steps-grid {
+          display: grid;
+          grid-template-columns: repeat(3, 1fr);
+          gap: 20px;
+          align-items: stretch;
+        }
+        .step-card {
+          display: flex;
+          flex-direction: column;
+          height: 100%;
+          box-sizing: border-box;
+          background-color: #ffffff;
+          border: 1px solid #e2e8f0;
+          border-radius: 16px;
+          padding: 22px 20px;
+          box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05), 0 2px 4px -2px rgba(0, 0, 0, 0.05);
+        }
+        .step-card-header {
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          gap: 8px;
+          flex-wrap: wrap;
+          margin-bottom: 12px;
+        }
+        .step-card-icon {
+          font-size: 22px;
+          line-height: 1;
+          display: inline-flex;
+          align-items: center;
+        }
+        .step-card-number {
+          font-size: 12px;
+          font-weight: 800;
+          letter-spacing: 0.04em;
+          color: #64748b;
+          background: #f1f5f9;
+          border: 1px solid #e2e8f0;
+          border-radius: 999px;
+          padding: 4px 8px;
+          line-height: 1;
+          white-space: nowrap;
+        }
+        .step-card-title {
+          flex: 1 1 100%;
+          font-size: 15px;
+          font-weight: 800;
+          color: #0f172a;
+          margin: 0;
+          line-height: 1.3;
+          text-align: center;
+        }
+        .step-card-body {
+          font-size: 13px;
+          color: #475569;
+          margin: 0;
+          line-height: 1.6;
+          text-align: center;
+          flex: 1;
+        }
+        @media (max-width: 768px) {
+          .steps-grid {
+            grid-template-columns: 1fr;
+            gap: 14px;
+          }
+          .step-card {
+            padding: 18px 16px;
+          }
+        }
+
+        .footer-link {
+          color: #475569;
+          font-size: 13px;
+          background: none;
+          border: none;
+          cursor: pointer;
+          transition: color 0.2s;
+          padding: 4px 8px;
+        }
+        .footer-link:hover {
+          color: #2563eb;
+          text-decoration: underline;
+        }
+
+        .modal-body-scroll::-webkit-scrollbar {
+          width: 6px;
+        }
+        .modal-body-scroll::-webkit-scrollbar-thumb {
+          background-color: #cbd5e1;
+          border-radius: 4px;
+        }
+      `}</style>
+
       {/* 1. ヘッダー */}
-      <header style={{ backgroundColor: 'rgba(30, 41, 59, 0.8)', backdropFilter: 'blur(10px)', borderBottom: '1px solid #334155', padding: '16px 24px', position: 'sticky', top: 0, zIndex: 50 }}>
-        <div style={{ maxWidth: '1000px', margin: '0 auto', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+      <header style={{ backgroundColor: 'rgba(255, 255, 255, 0.9)', backdropFilter: 'blur(12px)', borderBottom: `1px solid ${COLORS.border}`, padding: '16px 24px', position: 'sticky', top: 0, zIndex: 50 }}>
+        <div style={{ maxWidth: '1000px', margin: '0 auto', display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '12px', flexWrap: 'wrap' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
             <span style={{ fontSize: '24px' }}>🏠</span>
-            <span style={{ fontSize: '20px', fontWeight: '800', background: 'linear-gradient(to right, #38bdf8, #818cf8)', WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent' }}>
+            <span style={{ fontSize: '20px', fontWeight: '800', background: 'linear-gradient(to right, #2563eb, #4f46e5)', WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent' }}>
               物件セカンドオピニオン AI
             </span>
           </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-            <span style={{ fontSize: '11px', fontWeight: 'bold', color: '#38bdf8', backgroundColor: 'rgba(56, 189, 248, 0.15)', padding: '4px 12px', borderRadius: '20px', border: '1px solid rgba(56, 189, 248, 0.3)', letterSpacing: '1px' }}>
-              PRO VERSION
+          <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap' }}>
+            <span style={trialBadgeStyle}>
+              {isProUser
+                ? '月額PRO会員'
+                : isCurrentPropertyPurchased
+                  ? '単発購入済み（この物件）'
+                  : `無料お試し残り：${freeTrialsLeft}回`}
             </span>
+            <span
+              style={{
+                fontSize: '11px',
+                fontWeight: 700,
+                color: COLORS.textMuted,
+                backgroundColor: COLORS.cardAlt,
+                padding: '6px 10px',
+                borderRadius: '8px',
+                border: `1px solid ${COLORS.border}`,
+              }}
+              title={`userId=${user.userId}`}
+            >
+              {planStatusLabel}
+            </span>
+            {IS_DEV && (
+              <button
+                type="button"
+                onClick={resetFreeTrialsForDev}
+                style={{
+                  fontSize: '11px',
+                  fontWeight: 700,
+                  color: '#b45309',
+                  backgroundColor: '#fffbeb',
+                  padding: '6px 10px',
+                  borderRadius: '8px',
+                  border: '1px dashed #f59e0b',
+                  cursor: 'pointer',
+                  whiteSpace: 'nowrap',
+                }}
+                title="開発環境のみ表示。LocalStorageの無料枠を3に戻します"
+              >
+                [DEV] 無料枠を3回にリセット
+              </button>
+            )}
+            {user.isLoggedIn ? (
+              <>
+                <button
+                  type="button"
+                  onClick={() => {
+                    window.location.href = '/mypage';
+                  }}
+                  style={{ fontSize: '11px', fontWeight: 'bold', color: COLORS.textMuted, backgroundColor: COLORS.cardAlt, padding: '6px 12px', borderRadius: '20px', border: `1px solid ${COLORS.border}`, letterSpacing: '0.5px', cursor: 'pointer' }}
+                >
+                  👤 マイページ
+                </button>
+                <button
+                  type="button"
+                  onClick={handleLogout}
+                  style={{ fontSize: '11px', fontWeight: 'bold', color: '#b91c1c', backgroundColor: '#fef2f2', padding: '6px 12px', borderRadius: '20px', border: '1px solid #fecaca', letterSpacing: '0.5px', cursor: 'pointer' }}
+                >
+                  🚪 ログアウト
+                </button>
+              </>
+            ) : (
+              <button
+                type="button"
+                onClick={() => openAuthModal('login')}
+                style={{ fontSize: '11px', fontWeight: 'bold', color: '#1d4ed8', backgroundColor: '#eff6ff', padding: '6px 12px', borderRadius: '20px', border: '1px solid #93c5fd', letterSpacing: '0.5px', cursor: 'pointer' }}
+              >
+                ログイン / 新規登録
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={() => openPaywall()}
+              style={{ fontSize: '11px', fontWeight: 'bold', color: '#4f46e5', backgroundColor: 'rgba(79, 70, 229, 0.08)', padding: '6px 12px', borderRadius: '20px', border: '1px solid rgba(79, 70, 229, 0.25)', letterSpacing: '0.5px', cursor: 'pointer' }}
+            >
+              PRO VERSION
+            </button>
           </div>
         </div>
       </header>
 
-      {/* 2. ヒーローセクション（メインタイトル） */}
-      <section style={{ textAlign: 'center', padding: '60px 20px 40px', background: 'radial-gradient(circle at top, rgba(56, 189, 248, 0.15) 0%, rgba(15, 23, 42, 0) 70%)' }}>
+      {/* 2. ヒーローセクション */}
+      <section style={{ textAlign: 'center', padding: '60px 20px 40px', background: 'radial-gradient(circle at top, rgba(37, 99, 235, 0.08) 0%, rgba(248, 250, 252, 0) 70%)' }}>
         <div style={{ maxWidth: '800px', margin: '0 auto' }}>
-          <span style={{ color: '#38bdf8', fontSize: '13px', fontWeight: 'bold', letterSpacing: '2px', textTransform: 'uppercase', display: 'block', marginBottom: '12px' }}>
+          <span style={{ color: COLORS.accent, fontSize: '13px', fontWeight: 'bold', letterSpacing: '2px', textTransform: 'uppercase', display: 'block', marginBottom: '12px' }}>
             不動産屋の営業トークに惑わされない
           </span>
-          <h1 style={{ fontSize: '32px', fontWeight: '900', color: '#ffffff', lineHeight: '1.3', marginBottom: '16px' }}>
+          <h1 style={{ fontSize: '32px', fontWeight: '900', color: COLORS.text, lineHeight: '1.3', marginBottom: '16px' }}>
             AI不動産プロ査定で<br />
-            <span style={{ background: 'linear-gradient(to right, #38bdf8, #a855f7)', WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent' }}>
+            <span style={{ background: 'linear-gradient(to right, #2563eb, #4f46e5)', WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent' }}>
               「隠されたリスク」
             </span>
             を即時に完全見抜く
           </h1>
-          <p style={{ color: '#94a3b8', fontSize: '15px', lineHeight: '1.6', maxWidth: '600px', margin: '0 auto' }}>
-            SUUMOやHOME'Sのテキスト、間取り図画像を貼り付けるだけ。不動産鑑定士並みのロジックで適正相場・潜むデメリット・内見チェックポイントをAIが自動診断します。
+          <p style={{ color: COLORS.textMuted, fontSize: '15px', lineHeight: '1.6', maxWidth: '600px', margin: '0 auto' }}>
+            SUUMOやHOME&apos;Sのテキスト、間取り図画像を貼り付けるだけ。不動産鑑定士並みのロジックで適正相場・潜むデメリット・内見チェックポイントをAIが自動診断します。
           </p>
         </div>
       </section>
 
-      {/* 3. 3つの簡単なステップ */}
+      {/* 3. ステップ表示 */}
       <section style={{ maxWidth: '1000px', margin: '0 auto 40px', padding: '0 20px' }}>
-        <h2 style={{ textAlign: 'center', fontSize: '14px', color: '#64748b', textTransform: 'uppercase', letterSpacing: '1.5px', marginBottom: '24px' }}>
+        <h2 style={{ textAlign: 'center', fontSize: '14px', color: COLORS.textDim, textTransform: 'uppercase', letterSpacing: '1.5px', marginBottom: '24px' }}>
           HOW IT WORKS — 簡単 3 ステップ
         </h2>
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(250px, 1fr))', gap: '20px' }}>
-          
-          <div style={{ backgroundColor: '#1e293b', border: '1px solid #334155', borderRadius: '16px', padding: '20px', position: 'relative' }}>
-            <span style={{ fontSize: '32px', fontWeight: '900', color: '#334155', position: 'absolute', top: '12px', right: '16px' }}>01</span>
-            <div style={{ fontSize: '24px', marginBottom: '10px' }}>📋</div>
-            <h3 style={{ fontSize: '16px', fontWeight: 'bold', color: '#f8fafc', marginBottom: '8px' }}>情報をコピー</h3>
-            <p style={{ fontSize: '13px', color: '#94a3b8', margin: 0, lineHeight: '1.5' }}>
-              ポータルサイトの「物件概要」テキスト（家賃、広さ、築年数、駅徒歩など）をコピーします。
-            </p>
-          </div>
-
-          <div style={{ backgroundColor: '#1e293b', border: '1px solid #334155', borderRadius: '16px', padding: '20px', position: 'relative' }}>
-            <span style={{ fontSize: '32px', fontWeight: '900', color: '#334155', position: 'absolute', top: '12px', right: '16px' }}>02</span>
-            <div style={{ fontSize: '24px', marginBottom: '10px' }}>📸</div>
-            <h3 style={{ fontSize: '16px', fontWeight: 'bold', color: '#f8fafc', marginBottom: '8px' }}>画像添付（任意）</h3>
-            <p style={{ fontSize: '13px', color: '#94a3b8', margin: 0, lineHeight: '1.5' }}>
-              間取り図や外観の写真画像があればアップロード。AIが図面から採光や動線も読解します。
-            </p>
-          </div>
-
-          <div style={{ backgroundColor: '#1e293b', border: '1px solid #334155', borderRadius: '16px', padding: '20px', position: 'relative' }}>
-            <span style={{ fontSize: '32px', fontWeight: '900', color: '#334155', position: 'absolute', top: '12px', right: '16px' }}>03</span>
-            <div style={{ fontSize: '24px', marginBottom: '10px' }}>⚡</div>
-            <h3 style={{ fontSize: '16px', fontWeight: 'bold', color: '#f8fafc', marginBottom: '8px' }}>AI即時セカンドオピニオン</h3>
-            <p style={{ fontSize: '13px', color: '#94a3b8', margin: 0, lineHeight: '1.5' }}>
-              数秒で100点満点のスコア、妥当性評価、プロ視点の注意点リストを分析出力します。
-            </p>
-          </div>
-
+        <div className="steps-grid">
+          {[
+            { n: '01', icon: '📋', title: '情報をコピー', body: 'ポータルサイトの「物件概要」テキスト（家賃、広さ、築年数、駅徒歩など）をコピーします。' },
+            { n: '02', icon: '📸', title: '画像添付（任意）', body: '間取り図や外観の写真画像があればアップロード。AIが図面から採光や動線も読解します。' },
+            { n: '03', icon: '⚡', title: 'AI即時セカンドオピニオン', body: '数秒で100点満点のスコア、妥当性評価、プロ視点の注意点リストを分析出力します。' },
+          ].map((step) => (
+            <div key={step.n} className="step-card">
+              <div className="step-card-header">
+                <span className="step-card-icon" aria-hidden="true">{step.icon}</span>
+                <span className="step-card-number">Step {step.n}</span>
+                <h3 className="step-card-title">{step.title}</h3>
+              </div>
+              <p className="step-card-body">{step.body}</p>
+            </div>
+          ))}
         </div>
       </section>
 
       {/* 4. メイン入力フォーム */}
       <main style={{ maxWidth: '800px', margin: '0 auto', padding: '0 20px' }}>
-        <section style={{ backgroundColor: '#1e293b', padding: '28px', borderRadius: '20px', border: '1px solid #3b82f6', boxShadow: '0 20px 25px -5px rgba(0, 0, 0, 0.4), 0 0 15px rgba(59, 130, 246, 0.2)' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '16px' }}>
-            <span style={{ width: '8px', height: '8px', backgroundColor: '#38bdf8', borderRadius: '50%', display: 'inline-block' }}></span>
-            <h2 style={{ fontSize: '18px', fontWeight: 'bold', color: '#ffffff', margin: 0 }}>
-              物件診断フォーム
-            </h2>
+        <section style={{ backgroundColor: COLORS.card, padding: '28px', borderRadius: '20px', border: '1px solid #bfdbfe', boxShadow: '0 4px 6px -1px rgba(0,0,0,0.05), 0 0 0 1px rgba(37, 99, 235, 0.08)' }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px', gap: '12px', flexWrap: 'wrap' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <span style={{ width: '8px', height: '8px', backgroundColor: COLORS.accent, borderRadius: '50%', display: 'inline-block' }}></span>
+              <h2 style={{ fontSize: '18px', fontWeight: 'bold', color: COLORS.text, margin: 0 }}>
+                物件診断フォーム
+              </h2>
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+              <span style={trialBadgeStyle}>無料お試し残り：{freeTrialsLeft}回</span>
+              {(inputText || imagePreviews.length > 0 || result) && (
+                <button
+                  onClick={handleReset}
+                  disabled={loading}
+                  style={{ backgroundColor: 'transparent', color: COLORS.textDim, border: 'none', fontSize: '12px', cursor: 'pointer', textDecoration: 'underline' }}
+                >
+                  入力内容をクリア
+                </button>
+              )}
+            </div>
           </div>
-          
-          <textarea
-            style={{ width: '100%', height: '160px', padding: '16px', borderRadius: '12px', backgroundColor: '#0f172a', border: '1px solid #334155', color: '#f8fafc', fontSize: '14px', boxSizing: 'border-box', outline: 'none', resize: 'vertical', lineHeight: '1.6' }}
-            placeholder="ここに物件のテキスト情報（家賃、共益費、所在地、築年数、構造、駅徒歩、設備など）をそのまま貼り付けてください..."
-            value={inputText}
-            onChange={(e) => setInputText(e.target.value)}
-          />
+
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))', gap: '16px', marginBottom: '16px' }}>
+            <div>
+              <label style={{ display: 'block', fontSize: '12px', fontWeight: 'bold', color: COLORS.textMuted, marginBottom: '8px' }}>
+                物件タイプ
+              </label>
+              <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                <button type="button" disabled={loading} onClick={() => setPropertyType('rental')} style={optionChipStyle(propertyType === 'rental')}>
+                  賃貸
+                </button>
+                <button type="button" disabled={loading} onClick={() => setPropertyType('purchase')} style={optionChipStyle(propertyType === 'purchase')}>
+                  分譲（購入）
+                </button>
+              </div>
+            </div>
+            <div>
+              <label style={{ display: 'block', fontSize: '12px', fontWeight: 'bold', color: COLORS.textMuted, marginBottom: '8px' }}>
+                世帯タイプ
+              </label>
+              <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                <button type="button" disabled={loading} onClick={() => setHouseholdType('single')} style={optionChipStyle(householdType === 'single')}>
+                  一人暮らし
+                </button>
+                <button type="button" disabled={loading} onClick={() => setHouseholdType('family')} style={optionChipStyle(householdType === 'family')}>
+                  ファミリー（同居あり）
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <div style={{ position: 'relative' }}>
+            <textarea
+              disabled={loading}
+              maxLength={INPUT_TEXT_MAX_LENGTH}
+              style={{
+                width: '100%',
+                height: '160px',
+                padding: '16px',
+                paddingBottom: '36px',
+                borderRadius: '12px',
+                backgroundColor: COLORS.cardAlt,
+                border: `1px solid ${
+                  inputText.length >= INPUT_TEXT_MAX_LENGTH
+                    ? '#fca5a5'
+                    : inputText.length >= INPUT_TEXT_WARN_LENGTH
+                      ? '#fdba74'
+                      : COLORS.border
+                }`,
+                color: COLORS.text,
+                fontSize: '14px',
+                boxSizing: 'border-box',
+                outline: 'none',
+                resize: 'vertical',
+                lineHeight: '1.6',
+              }}
+              placeholder={
+                propertyType === 'rental'
+                  ? `ここに物件のテキスト情報（家賃、共益費、所在地、築年数、構造、駅徒歩、設備、気になっている点など）をそのまま貼り付けてください...\n\n${FORM_INPUT_HINT}\n（最大3,000文字まで）`
+                  : `ここに物件のテキスト情報（価格、管理費、修繕積立、所在地、築年数、構造、駅徒歩、設備、気になっている点など）をそのまま貼り付けてください...\n\n${FORM_INPUT_HINT}\n（最大3,000文字まで）`
+              }
+              value={inputText}
+              onChange={(e) => setInputText(e.target.value.slice(0, INPUT_TEXT_MAX_LENGTH))}
+            />
+            <span
+              aria-live="polite"
+              style={{
+                position: 'absolute',
+                right: '12px',
+                bottom: '10px',
+                fontSize: '12px',
+                fontWeight: 700,
+                fontVariantNumeric: 'tabular-nums',
+                pointerEvents: 'none',
+                color:
+                  inputText.length >= INPUT_TEXT_MAX_LENGTH
+                    ? '#dc2626'
+                    : inputText.length >= INPUT_TEXT_WARN_LENGTH
+                      ? '#ea580c'
+                      : COLORS.textDim,
+              }}
+            >
+              {inputText.length.toLocaleString('ja-JP')} / {INPUT_TEXT_MAX_LENGTH.toLocaleString('ja-JP')}
+            </span>
+          </div>
 
           <div style={{ marginTop: '20px' }}>
-            <label style={{ display: 'block', fontSize: '13px', fontWeight: 'bold', color: '#94a3b8', marginBottom: '10px' }}>
+            <label style={{ display: 'block', fontSize: '13px', fontWeight: 'bold', color: COLORS.textMuted, marginBottom: '10px' }}>
               📷 間取り図・外観・内装画像を追加（マルチモーダルAI解析）
             </label>
             <input
               type="file"
               accept="image/*"
               multiple
+              disabled={loading}
               onChange={handleImageUpload}
-              style={{ fontSize: '13px', color: '#94a3b8' }}
+              style={{ fontSize: '13px', color: COLORS.textMuted }}
             />
 
             {imagePreviews.length > 0 && (
               <div style={{ display: 'flex', gap: '12px', marginTop: '14px', overflowX: 'auto', paddingBottom: '6px' }}>
                 {imagePreviews.map((src, idx) => (
-                  <img
-                    key={idx}
-                    src={src}
-                    alt={`Preview ${idx}`}
-                    style={{ width: '80px', height: '80px', objectFit: 'cover', borderRadius: '10px', border: '2px solid #3b82f6' }}
-                  />
+                  <div key={idx} style={{ position: 'relative', display: 'inline-block', flexShrink: 0 }}>
+                    <img
+                      src={src}
+                      alt={`Preview ${idx}`}
+                      style={{ width: '80px', height: '80px', objectFit: 'cover', borderRadius: '10px', border: '2px solid #2563eb' }}
+                    />
+                    <button
+                      onClick={() => handleRemoveImage(idx)}
+                      disabled={loading}
+                      style={{ position: 'absolute', top: '-6px', right: '-6px', backgroundColor: '#ef4444', color: '#ffffff', border: 'none', borderRadius: '50%', width: '20px', height: '20px', cursor: 'pointer', fontSize: '12px', display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 'bold' }}
+                      title="画像を削除"
+                    >
+                      ✕
+                    </button>
+                  </div>
                 ))}
               </div>
             )}
           </div>
 
           {error && (
-            <div style={{ marginTop: '20px', padding: '14px', backgroundColor: 'rgba(239, 68, 68, 0.15)', border: '1px solid #ef4444', color: '#fca5a5', fontSize: '14px', borderRadius: '10px' }}>
-              ⚠️ {error}
+            errorRetryable ? (
+              <ApiErrorPanel
+                message={error}
+                onRetry={handleAnalyze}
+                onContact={() => {
+                  setContactSubmitted(false);
+                  setContactError(null);
+                  setActiveModal('contact');
+                }}
+                retryDisabled={loading}
+              />
+            ) : (
+              <div style={{ marginTop: '20px', padding: '14px', backgroundColor: '#fef2f2', border: '1px solid #fecaca', color: '#b91c1c', fontSize: '14px', borderRadius: '10px' }}>
+                ⚠️ {error}
+              </div>
+            )
+          )}
+
+          {freeTrialsLeft <= 0 && (
+            <div style={{ marginTop: '16px', padding: '12px 14px', backgroundColor: '#eef2ff', border: '1px solid #c7d2fe', color: '#3730a3', fontSize: '13px', borderRadius: '10px' }}>
+              基本診断（スコア・メリット・リスク・詳細分析）は無料のままご利用できます。PRO限定4機能（AIチャット・内見チェック・履歴トラッキング・将来予測）の解放にはPRO登録が必要です。
             </div>
           )}
 
           <button
             onClick={handleAnalyze}
             disabled={loading}
-            style={{ width: '100%', marginTop: '24px', backgroundColor: loading ? '#475569' : '#2563eb', color: '#ffffff', fontWeight: '800', padding: '16px', borderRadius: '12px', border: 'none', cursor: loading ? 'not-allowed' : 'pointer', fontSize: '16px', boxShadow: loading ? 'none' : '0 4px 14px rgba(37, 99, 235, 0.4)', transition: 'all 0.2s' }}
+            style={{ width: '100%', marginTop: '24px', backgroundColor: loading ? '#94a3b8' : '#2563eb', color: '#ffffff', fontWeight: '800', padding: '16px', borderRadius: '12px', border: 'none', cursor: loading ? 'not-allowed' : 'pointer', fontSize: '16px', boxShadow: loading ? 'none' : '0 4px 14px rgba(37, 99, 235, 0.3)', transition: 'all 0.2s', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '10px' }}
           >
-            {loading ? 'AIがプロの眼で分析中...' : '🔍 この物件をプロAI査定する'}
+            {loading ? <span>⏳ 査定を実行中...</span> : '🔍 この物件をプロAI査定する'}
           </button>
-        </section>
 
-        {/* 5. 査定結果表示エリア */}
-        {result && (
-          <div style={{ marginTop: '32px', display: 'flex', flexDirection: 'column', gap: '24px' }}>
-            {/* 総合スコアと概要 */}
-            <section style={{ backgroundColor: '#1e293b', padding: '28px', borderRadius: '20px', border: '1px solid #334155', boxShadow: '0 10px 25px -5px rgba(0, 0, 0, 0.3)' }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px', borderBottom: '1px solid #334155', paddingBottom: '20px' }}>
-                <div>
-                  <span style={{ color: '#38bdf8', fontSize: '12px', fontWeight: 'bold', letterSpacing: '1px' }}>AI OVERALL EVALUATION</span>
-                  <h3 style={{ fontSize: '20px', fontWeight: 'bold', color: '#f8fafc', margin: '4px 0 0 0' }}>総合診断スコア</h3>
-                </div>
-                <div style={{ backgroundColor: 'rgba(37, 99, 235, 0.2)', border: '2px solid #3b82f6', color: '#60a5fa', padding: '8px 24px', borderRadius: '24px', textAlign: 'center' }}>
-                  <span style={{ fontSize: '36px', fontWeight: '900' }}>{result.score}</span>
-                  <span style={{ fontSize: '13px', color: '#93c5fd', marginLeft: '4px' }}>/ 100</span>
+          {loading && (
+            <div style={{ marginTop: '24px', paddingTop: '24px', borderTop: `1px solid ${COLORS.border}`, textAlign: 'center' }}>
+              <div style={{ position: 'relative', width: '60px', height: '60px', margin: '0 auto 16px' }}>
+                <div className="pulse-container" style={{ position: 'absolute', inset: 0, borderRadius: '50%', backgroundColor: 'rgba(37, 99, 235, 0.12)', border: '1px solid rgba(37, 99, 235, 0.35)' }}></div>
+                <div className="loading-ring" style={{ position: 'absolute', inset: 0, borderRadius: '50%', border: '4px solid transparent', borderTopColor: '#2563eb', borderRightColor: '#4f46e5' }}></div>
+                <div style={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '20px' }}>🏠</div>
+              </div>
+
+              <p
+                key={loadingStepIndex}
+                className="loading-step-text"
+                style={{ color: COLORS.accent, fontSize: '14px', fontWeight: '700', margin: '0 0 16px 0', minHeight: '22px' }}
+              >
+                {LOADING_STEPS[loadingStepIndex]}
+              </p>
+
+              <div style={{ maxWidth: '420px', margin: '0 auto' }}>
+                <div
+                  style={{
+                    width: '100%',
+                    height: '10px',
+                    backgroundColor: COLORS.elevated,
+                    borderRadius: '999px',
+                    overflow: 'hidden',
+                    border: `1px solid ${COLORS.border}`,
+                  }}
+                >
+                  <div
+                    className="progress-bar-fill"
+                    style={{
+                      height: '100%',
+                      width: `${progressPercent}%`,
+                      borderRadius: '999px',
+                      transition: 'width 0.15s linear',
+                    }}
+                  />
                 </div>
               </div>
-              <p style={{ fontSize: '15px', lineHeight: '1.8', color: '#cbd5e1', margin: 0 }}>{result.summary}</p>
+
+              <button
+                type="button"
+                onClick={handleCancelAnalyze}
+                style={{
+                  marginTop: '18px',
+                  backgroundColor: '#ffffff',
+                  color: '#b91c1c',
+                  border: '1px solid #fecaca',
+                  borderRadius: '10px',
+                  padding: '10px 18px',
+                  fontSize: '13px',
+                  fontWeight: 700,
+                  cursor: 'pointer',
+                }}
+              >
+                解析をキャンセル
+              </button>
+            </div>
+          )}
+        </section>
+
+        {/* 5. 査定結果 */}
+        {result && !loading && (
+          <div style={{ marginTop: '32px', display: 'flex', flexDirection: 'column', gap: '24px' }}>
+            <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+              <button
+                onClick={handleCopyResult}
+                style={{ backgroundColor: copied ? '#22c55e' : '#64748b', color: '#ffffff', border: 'none', padding: '8px 16px', borderRadius: '8px', fontSize: '13px', fontWeight: 'bold', cursor: 'pointer', transition: 'all 0.2s', display: 'flex', alignItems: 'center', gap: '6px' }}
+              >
+                {copied ? '✓ コピーしました！' : '📋 診断結果をテキストコピー'}
+              </button>
+            </div>
+
+            <section style={{ backgroundColor: COLORS.card, padding: '28px', borderRadius: '20px', border: `1px solid ${COLORS.border}`, boxShadow: COLORS.cardShadow }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px', borderBottom: `1px solid ${COLORS.border}`, paddingBottom: '20px', gap: '16px', flexWrap: 'wrap' }}>
+                <div>
+                  <span style={{ color: COLORS.accent, fontSize: '12px', fontWeight: 'bold', letterSpacing: '1px' }}>AI OVERALL EVALUATION</span>
+              <h3 style={{ fontSize: '20px', fontWeight: 'bold', color: COLORS.text, margin: '4px 0 0 0' }}>
+                総合診断スコア
+                <span style={{ marginLeft: '8px', fontSize: '11px', fontWeight: 700, color: '#15803d', backgroundColor: '#f0fdf4', padding: '3px 8px', borderRadius: '999px', border: '1px solid #bbf7d0', verticalAlign: 'middle' }}>無料・無制限</span>
+              </h3>
+                </div>
+                <div style={{ backgroundColor: COLORS.scoreBg, border: '2px solid #2563eb', color: COLORS.text, padding: '10px 28px', borderRadius: '24px', textAlign: 'center', boxShadow: '0 4px 14px rgba(37, 99, 235, 0.15)' }}>
+                  <span style={{ fontSize: '40px', fontWeight: '900', letterSpacing: '-1px', color: '#2563eb' }}>{result.score}</span>
+                  <span style={{ fontSize: '14px', color: COLORS.textMuted, marginLeft: '4px', fontWeight: 700 }}>/ 100</span>
+                </div>
+              </div>
+              <p style={{ fontSize: '15px', lineHeight: '1.8', color: COLORS.textMuted, margin: 0 }}>{result.summary}</p>
             </section>
 
-            {/* メリット & デメリット */}
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))', gap: '20px' }}>
-              <section style={{ backgroundColor: 'rgba(22, 101, 52, 0.15)', border: '1px solid #22c55e', padding: '24px', borderRadius: '20px' }}>
-                <h3 style={{ fontSize: '16px', fontWeight: 'bold', color: '#4ade80', margin: '0 0 16px 0', display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <section style={{ backgroundColor: '#f0fdf4', border: '1px solid #bbf7d0', padding: '24px', borderRadius: '20px', boxShadow: COLORS.cardShadow }}>
+                <h3 style={{ fontSize: '16px', fontWeight: 'bold', color: '#15803d', margin: '0 0 16px 0', display: 'flex', alignItems: 'center', gap: '8px' }}>
                   <span>👍</span> プロが評価するアドバンテージ
                 </h3>
-                <ul style={{ paddingLeft: '20px', margin: 0, fontSize: '14px', color: '#bbf7d0', lineHeight: '1.7' }}>
+                <ul style={{ paddingLeft: '20px', margin: 0, fontSize: '14px', color: '#166534', lineHeight: '1.7' }}>
                   {result.pros.map((pro, i) => (
                     <li key={i} style={{ marginBottom: '8px' }}>{pro}</li>
                   ))}
                 </ul>
               </section>
 
-              <section style={{ backgroundColor: 'rgba(153, 27, 27, 0.15)', border: '1px solid #ef4444', padding: '24px', borderRadius: '20px' }}>
-                <h3 style={{ fontSize: '16px', fontWeight: 'bold', color: '#f87171', margin: '0 0 16px 0', display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <section style={{ backgroundColor: '#fef2f2', border: '1px solid #fecaca', padding: '24px', borderRadius: '20px', boxShadow: COLORS.cardShadow }}>
+                <h3 style={{ fontSize: '16px', fontWeight: 'bold', color: '#b91c1c', margin: '0 0 16px 0', display: 'flex', alignItems: 'center', gap: '8px' }}>
                   <span>⚠️</span> 潜むリスク・注意すべき欠点
                 </h3>
-                <ul style={{ paddingLeft: '20px', margin: 0, fontSize: '14px', color: '#fecaca', lineHeight: '1.7' }}>
+                <ul style={{ paddingLeft: '20px', margin: 0, fontSize: '14px', color: '#991b1b', lineHeight: '1.7' }}>
                   {result.cons.map((con, i) => (
                     <li key={i} style={{ marginBottom: '8px' }}>{con}</li>
                   ))}
@@ -249,77 +1859,796 @@ export default function Home() {
               </section>
             </div>
 
-            {/* 詳細分析 */}
-            <section style={{ backgroundColor: '#1e293b', padding: '28px', borderRadius: '20px', border: '1px solid #334155' }}>
-              <h3 style={{ fontSize: '18px', fontWeight: 'bold', color: '#f8fafc', margin: '0 0 20px 0', borderBottom: '1px solid #334155', paddingBottom: '12px' }}>
+            <section style={{ backgroundColor: COLORS.card, padding: '28px', borderRadius: '20px', border: `1px solid ${COLORS.border}`, boxShadow: COLORS.cardShadow }}>
+              <h3 style={{ fontSize: '18px', fontWeight: 'bold', color: COLORS.text, margin: '0 0 20px 0', borderBottom: `1px solid ${COLORS.border}`, paddingBottom: '12px' }}>
                 分野別ディープアナリシス
+                <span style={{ marginLeft: '8px', fontSize: '11px', fontWeight: 700, color: '#15803d', backgroundColor: '#f0fdf4', padding: '3px 8px', borderRadius: '999px', border: '1px solid #bbf7d0' }}>無料・無制限</span>
               </h3>
               <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
-                <div style={{ backgroundColor: '#0f172a', padding: '16px', borderRadius: '12px', border: '1px solid #334155' }}>
-                  <h4 style={{ fontSize: '14px', fontWeight: 'bold', color: '#38bdf8', margin: '0 0 6px 0' }}>💰 価格・費用感の妥当性</h4>
-                  <p style={{ fontSize: '14px', color: '#cbd5e1', margin: 0, lineHeight: '1.6' }}>{result.details.priceEvaluation}</p>
+                <div style={{ backgroundColor: COLORS.cardAlt, padding: '16px', borderRadius: '12px', border: `1px solid ${COLORS.border}` }}>
+                  <h4 style={{ fontSize: '14px', fontWeight: 'bold', color: COLORS.accent, margin: '0 0 6px 0' }}>💰 価格・費用感の妥当性</h4>
+                  <p style={{ fontSize: '14px', color: COLORS.textMuted, margin: 0, lineHeight: '1.6' }}>{result.details.priceEvaluation}</p>
                 </div>
-                <div style={{ backgroundColor: '#0f172a', padding: '16px', borderRadius: '12px', border: '1px solid #334155' }}>
-                  <h4 style={{ fontSize: '14px', fontWeight: 'bold', color: '#38bdf8', margin: '0 0 6px 0' }}>📍 立地・生活利便性・環境</h4>
-                  <p style={{ fontSize: '14px', color: '#cbd5e1', margin: 0, lineHeight: '1.6' }}>{result.details.locationEvaluation}</p>
+                <div style={{ backgroundColor: COLORS.cardAlt, padding: '16px', borderRadius: '12px', border: `1px solid ${COLORS.border}` }}>
+                  <h4 style={{ fontSize: '14px', fontWeight: 'bold', color: COLORS.accent, margin: '0 0 6px 0' }}>📍 立地・生活利便性・環境</h4>
+                  <p style={{ fontSize: '14px', color: COLORS.textMuted, margin: 0, lineHeight: '1.6' }}>{result.details.locationEvaluation}</p>
                 </div>
-                <div style={{ backgroundColor: '#0f172a', padding: '16px', borderRadius: '12px', border: '1px solid #334155' }}>
-                  <h4 style={{ fontSize: '14px', fontWeight: 'bold', color: '#38bdf8', margin: '0 0 6px 0' }}>📐 間取り・居住性・設備構造</h4>
-                  <p style={{ fontSize: '14px', color: '#cbd5e1', margin: 0, lineHeight: '1.6' }}>{result.details.layoutEvaluation}</p>
+                <div style={{ backgroundColor: COLORS.cardAlt, padding: '16px', borderRadius: '12px', border: `1px solid ${COLORS.border}` }}>
+                  <h4 style={{ fontSize: '14px', fontWeight: 'bold', color: COLORS.accent, margin: '0 0 6px 0' }}>📐 間取り・居住性・設備構造</h4>
+                  <p style={{ fontSize: '14px', color: COLORS.textMuted, margin: 0, lineHeight: '1.6' }}>{result.details.layoutEvaluation}</p>
                 </div>
               </div>
             </section>
 
-            {/* 内見チェックリスト */}
-            <section style={{ backgroundColor: 'rgba(146, 64, 14, 0.15)', border: '1px solid #f59e0b', padding: '28px', borderRadius: '20px' }}>
-              <h3 style={{ fontSize: '18px', fontWeight: 'bold', color: '#fbbf24', margin: '0 0 16px 0', display: 'flex', alignItems: 'center', gap: '8px' }}>
-                <span>📋</span> 現地内見で絶対に確認すべきポイント
+            {/* PRO限定コンテンツ（①〜④） */}
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '12px', flexWrap: 'wrap' }}>
+              <h3 style={{ margin: 0, fontSize: '16px', fontWeight: 800, color: COLORS.text }}>
+                PRO限定コンテンツ（4機能）
               </h3>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
-                {result.viewingChecklist.map((item, i) => (
-                  <label key={i} style={{ display: 'flex', alignItems: 'center', gap: '12px', fontSize: '14px', color: '#fef3c7', cursor: 'pointer', backgroundColor: 'rgba(0, 0, 0, 0.2)', padding: '12px', borderRadius: '8px' }}>
-                    <input type="checkbox" style={{ width: '18px', height: '18px', accentColor: '#f59e0b' }} />
-                    <span>{item}</span>
-                  </label>
-                ))}
+              <span style={trialBadgeStyle}>無料お試し残り：{freeTrialsLeft}回</span>
+            </div>
+
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '20px', width: '100%' }}>
+            {/* PRO① チャット */}
+            <section
+              style={{
+                position: 'relative',
+                backgroundColor: COLORS.card,
+                border: `1px solid ${COLORS.border}`,
+                borderRadius: '16px',
+                padding: '24px',
+                overflow: 'hidden',
+                boxShadow: COLORS.cardShadow,
+                height: '100%',
+                boxSizing: 'border-box',
+                display: 'flex',
+                flexDirection: 'column',
+              }}
+            >
+              {!isProContentLocked && (
+                <div style={{ marginBottom: '12px' }}>
+                  <span style={{ fontSize: '11px', fontWeight: 700, color: COLORS.accent, backgroundColor: 'rgba(37, 99, 235, 0.08)', padding: '4px 10px', borderRadius: '999px', border: '1px solid rgba(37, 99, 235, 0.2)' }}>
+                    PRO限定①・無料体験中
+                  </span>
+                </div>
+              )}
+              <div style={{ filter: isProContentLocked ? 'blur(6px)' : 'none', pointerEvents: isProContentLocked ? 'none' : 'auto', userSelect: isProContentLocked ? 'none' : 'auto', flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
+                <h3 style={{ fontSize: '18px', fontWeight: 'bold', color: COLORS.text, margin: '0 0 8px 0' }}>
+                  💬 【PRO機能①】専属AIアドバイザーと本音チャット相談
+                </h3>
+                <p style={{ fontSize: '13px', color: COLORS.textMuted, margin: '0 0 16px 0' }}>
+                  結論→根拠→具体アドバイスまで、フランクな本音で答えます。
+                </p>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '10px', flex: 1, minHeight: '180px', maxHeight: '260px', overflowY: 'auto', marginBottom: '14px', padding: '12px', backgroundColor: COLORS.cardAlt, borderRadius: '12px', border: `1px solid ${COLORS.border}` }}>
+                  {chatMessages.length === 0 && (
+                    <p style={{ margin: 0, fontSize: '13px', color: COLORS.textDim }}>
+                      例：「この家賃は交渉できそう？」「ファミリー向けの懸念点は？」
+                    </p>
+                  )}
+                  {chatMessages.map((msg, idx) => (
+                    <div
+                      key={`${msg.role}-${idx}`}
+                      style={{
+                        alignSelf: msg.role === 'user' ? 'flex-end' : 'flex-start',
+                        maxWidth: '85%',
+                        padding: '10px 12px',
+                        borderRadius: '12px',
+                        backgroundColor: msg.role === 'user' ? '#2563eb' : '#ffffff',
+                        color: msg.role === 'user' ? '#ffffff' : COLORS.text,
+                        border: msg.role === 'user' ? 'none' : `1px solid ${COLORS.border}`,
+                        fontSize: '13px',
+                        lineHeight: 1.6,
+                        whiteSpace: 'pre-wrap',
+                      }}
+                    >
+                      {msg.text}
+                    </div>
+                  ))}
+                </div>
+                {chatError && (
+                  chatErrorRetryable ? (
+                    <ApiErrorPanel
+                      message={chatError}
+                      onRetry={handleChatRetry}
+                      onContact={() => {
+                        setContactSubmitted(false);
+                        setContactError(null);
+                        setActiveModal('contact');
+                      }}
+                      retryDisabled={chatLoading}
+                    />
+                  ) : (
+                    <div style={{ marginBottom: '10px', padding: '10px', backgroundColor: '#fef2f2', border: '1px solid #fecaca', color: '#b91c1c', borderRadius: '8px', fontSize: '13px' }}>
+                      ⚠️ {chatError}
+                    </div>
+                  )
+                )}
+                {chatLoading && (
+                  <div
+                    style={{
+                      marginBottom: '10px',
+                      padding: '10px 12px',
+                      backgroundColor: 'rgba(37, 99, 235, 0.06)',
+                      border: '1px solid rgba(37, 99, 235, 0.2)',
+                      borderRadius: '8px',
+                      color: COLORS.accent,
+                      fontSize: '13px',
+                      fontWeight: 700,
+                    }}
+                  >
+                    ⏳ 詳細を分析して回答を作成中...
+                  </div>
+                )}
+                <form onSubmit={handleChatSubmit} style={{ display: 'flex', gap: '8px', marginTop: 'auto' }}>
+                  <input
+                    type="text"
+                    value={chatInput}
+                    onChange={(e) => setChatInput(e.target.value)}
+                    disabled={chatLoading || isProContentLocked}
+                    placeholder="この物件について本音で質問する..."
+                    style={{ ...inputStyle, flex: 1 }}
+                  />
+                  <button
+                    type="submit"
+                    disabled={chatLoading || !chatInput.trim() || isProContentLocked}
+                    style={{
+                      backgroundColor: chatLoading ? '#94a3b8' : '#2563eb',
+                      color: '#ffffff',
+                      border: 'none',
+                      borderRadius: '8px',
+                      padding: '0 16px',
+                      fontWeight: 700,
+                      cursor: chatLoading || !chatInput.trim() ? 'not-allowed' : 'pointer',
+                      whiteSpace: 'nowrap',
+                    }}
+                  >
+                    送信
+                  </button>
+                </form>
               </div>
+              {isProContentLocked && (
+                <div
+                  style={{
+                    position: 'absolute',
+                    inset: 0,
+                    display: 'flex',
+                    flexDirection: 'column',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    background: 'linear-gradient(180deg, rgba(248,250,252,0.55) 0%, rgba(241,245,249,0.92) 100%)',
+                    gap: '12px',
+                    padding: '20px',
+                    textAlign: 'center',
+                  }}
+                >
+                  <span style={{ fontSize: '28px' }}>🔒</span>
+                  <p style={{ margin: 0, fontSize: '16px', fontWeight: 800, color: COLORS.text }}>PRO登録で表示</p>
+                  <button
+                    type="button"
+                    onClick={() => openPaywall()}
+                    style={{
+                      background: 'linear-gradient(to right, #4f46e5, #2563eb)',
+                      color: '#ffffff',
+                      fontWeight: 800,
+                      padding: '10px 22px',
+                      borderRadius: '999px',
+                      border: 'none',
+                      cursor: 'pointer',
+                      fontSize: '13px',
+                    }}
+                  >
+                    ロック解除する
+                  </button>
+                </div>
+              )}
             </section>
+
+            {/* PRO② 内見チェックリスト */}
+            {isProContentLocked ? (
+              <ProFeatureBlock
+                locked
+                title="📋 【PRO機能②】現地内見の絶対確認チェックリスト"
+                previewLines={
+                  result.viewingChecklist.length > 0
+                    ? result.viewingChecklist
+                    : ['内見チェック項目1', '内見チェック項目2', '内見チェック項目3']
+                }
+              />
+            ) : (
+              <section style={{ backgroundColor: '#fffbeb', border: '1px solid #fde68a', padding: '28px', borderRadius: '20px', boxShadow: COLORS.cardShadow, height: '100%', boxSizing: 'border-box', overflow: 'auto' }}>
+                <div style={{ marginBottom: '12px' }}>
+                  <span style={{ fontSize: '11px', fontWeight: 700, color: COLORS.accent, backgroundColor: 'rgba(37, 99, 235, 0.08)', padding: '4px 10px', borderRadius: '999px', border: '1px solid rgba(37, 99, 235, 0.2)' }}>
+                    PRO限定②・無料体験中
+                  </span>
+                </div>
+                <h3 style={{ fontSize: '18px', fontWeight: 'bold', color: '#b45309', margin: '0 0 16px 0', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                  <span>📋</span> 【PRO機能②】現地内見の絶対確認チェックリスト
+                </h3>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+                  {result.viewingChecklist.map((item, i) => (
+                    <label key={i} style={{ display: 'flex', alignItems: 'flex-start', gap: '12px', fontSize: '14px', color: '#92400e', cursor: 'pointer', backgroundColor: '#ffffff', padding: '12px', borderRadius: '8px', border: '1px solid #fde68a' }}>
+                      <input type="checkbox" style={{ width: '18px', height: '18px', accentColor: '#f59e0b', marginTop: '2px', flexShrink: 0 }} />
+                      <span>{item}</span>
+                    </label>
+                  ))}
+                </div>
+              </section>
+            )}
+
+            {/* PRO③ 履歴トラッキング */}
+            <ProFeatureBlock
+              locked={isProContentLocked}
+              title={`📊 ${PRO_FEATURE3_BY_TYPE[propertyType].title}`}
+              previewLines={priceHistoryLines}
+            />
+
+            {/* PRO④ 将来予測 */}
+            <ProFeatureBlock
+              locked={isProContentLocked}
+              title={`🔮 ${PRO_FEATURE4_BY_TYPE[propertyType].title}`}
+              previewLines={futureForecastLines}
+            />
+            </div>
+
+            <DisclaimerNotice />
           </div>
         )}
 
-        {/* 6. PROプラン・機能比較・安心の説明 */}
-        <section style={{ marginTop: '60px', backgroundColor: '#1e293b', padding: '32px', borderRadius: '24px', border: '1px solid #334155', textAlign: 'center' }}>
-          <span style={{ color: '#a855f7', fontSize: '12px', fontWeight: 'bold', letterSpacing: '2px', textTransform: 'uppercase' }}>
-            PREMIUM OPINION
+        {/* 6. PROプラン訴求 */}
+        <section style={{ marginTop: '60px', backgroundColor: COLORS.card, padding: '36px 28px', borderRadius: '24px', border: '1px solid #c7d2fe', boxShadow: '0 4px 6px -1px rgba(0,0,0,0.05), 0 0 24px rgba(79, 70, 229, 0.08)', textAlign: 'center' }}>
+          <span style={{ color: '#4338ca', fontSize: '12px', fontWeight: 'bold', letterSpacing: '1px', backgroundColor: '#eef2ff', padding: '6px 14px', borderRadius: '20px', border: '1px solid #c7d2fe' }}>
+            基本診断は無料無制限 / PROお試し残り{freeTrialsLeft}回
           </span>
-          <h2 style={{ fontSize: '22px', fontWeight: 'bold', color: '#ffffff', margin: '8px 0 16px 0' }}>
-            なぜAIセカンドオピニオンが必要なのか？
+          <h2 style={{ fontSize: '24px', fontWeight: 'bold', color: COLORS.text, margin: '16px 0 12px 0' }}>
+            「絶対に損したくない」あなたのためのPRO限定4機能
           </h2>
-          <p style={{ fontSize: '14px', color: '#94a3b8', lineHeight: '1.7', maxWidth: '650px', margin: '0 auto 28px' }}>
-            不動産屋は「契約を取ること」が目的のため、ネガティブな情報を積極的に教えてくれないケースがあります。当AIは完全第三者の中立な立場から、最新の相場・構造データをもとに冷徹かつ公正に査定します。
+          <p style={{ fontSize: '14px', color: COLORS.textMuted, lineHeight: '1.7', maxWidth: '650px', margin: '0 auto 32px' }}>
+            現在の選択：{propertyType === 'rental' ? '賃貸' : '分譲（購入）'} × {householdType === 'single' ? '一人暮らし' : 'ファミリー'}向けに、機能③④の内容を最適化して表示しています。
           </p>
 
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: '16px', textAlign: 'left' }}>
-            <div style={{ backgroundColor: '#0f172a', padding: '20px', borderRadius: '12px', border: '1px solid #334155' }}>
-              <div style={{ color: '#38bdf8', fontWeight: 'bold', marginBottom: '6px' }}>🛡️ 完全中立な査定</div>
-              <div style={{ fontSize: '12px', color: '#94a3b8', lineHeight: '1.5' }}>特定の不動産会社への誘導なし。客観的数値のみで評価。</div>
-            </div>
-            <div style={{ backgroundColor: '#0f172a', padding: '20px', borderRadius: '12px', border: '1px solid #334155' }}>
-              <div style={{ color: '#38bdf8', fontWeight: 'bold', marginBottom: '6px' }}>👁️ 画像読解機能</div>
-              <div style={{ fontSize: '12px', color: '#94a3b8', lineHeight: '1.5' }}>間取り図の壁位置や柱の飛び出し、周辺画像も高精度認識。</div>
-            </div>
-            <div style={{ backgroundColor: '#0f172a', padding: '20px', borderRadius: '12px', border: '1px solid #334155' }}>
-              <div style={{ color: '#38bdf8', fontWeight: 'bold', marginBottom: '6px' }}>📝 内見リスト出力</div>
-              <div style={{ fontSize: '12px', color: '#94a3b8', lineHeight: '1.5' }}>現地で失敗しないための「個別確認リスト」を自動作成。</div>
-            </div>
+          <div className="pro-features-grid" style={{ textAlign: 'left' }}>
+            {proFeatures.map((item) => (
+              <div key={item.title} style={{ backgroundColor: COLORS.cardAlt, padding: '24px', borderRadius: '16px', border: `1px solid ${COLORS.border}`, boxShadow: COLORS.cardShadow, height: '100%', boxSizing: 'border-box' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '10px' }}>
+                  <span style={{ fontSize: '22px', lineHeight: 1, flexShrink: 0 }}>{item.icon}</span>
+                  <h3 style={{ color: COLORS.accentStrong, fontWeight: 'bold', fontSize: '15px', margin: 0, lineHeight: 1.4 }}>{item.title}</h3>
+                </div>
+                <p style={{ fontSize: '13px', color: COLORS.textMuted, lineHeight: '1.6', margin: 0 }}>{item.body}</p>
+              </div>
+            ))}
           </div>
+
+          <button
+            type="button"
+            onClick={() => openPaywall()}
+            style={{ marginTop: '32px', background: 'linear-gradient(to right, #4f46e5, #2563eb)', color: '#ffffff', fontWeight: '800', padding: '14px 32px', borderRadius: '30px', border: 'none', cursor: 'pointer', fontSize: '15px', boxShadow: '0 4px 18px rgba(37, 99, 235, 0.3)' }}
+          >
+            ✨ PROプランに登録する
+          </button>
         </section>
       </main>
 
       {/* 7. フッター */}
-      <footer style={{ marginTop: '60px', textAlign: 'center', borderTop: '1px solid #334155', paddingTop: '30px', color: '#64748b', fontSize: '13px' }}>
-        <p>© 物件セカンドオピニオン AI Pro All Rights Reserved.</p>
+      <footer style={{ marginTop: '60px', textAlign: 'center', borderTop: `1px solid ${COLORS.border}`, paddingTop: '30px', paddingBottom: '20px' }}>
+        <div style={{ display: 'flex', justifyContent: 'center', gap: '20px', marginBottom: '16px', flexWrap: 'wrap' }}>
+          <button className="footer-link" onClick={() => setActiveModal('terms')}>
+            免責事項
+          </button>
+          <span style={{ color: COLORS.elevated }}>|</span>
+          <button className="footer-link" onClick={() => setActiveModal('agreement')}>
+            利用規約
+          </button>
+          <span style={{ color: COLORS.elevated }}>|</span>
+          <button className="footer-link" onClick={() => setActiveModal('tokushoho')}>
+            特定商取引法に基づく表記
+          </button>
+          <span style={{ color: COLORS.elevated }}>|</span>
+          <button className="footer-link" onClick={() => setActiveModal('privacy')}>
+            プライバシーポリシー
+          </button>
+          <span style={{ color: COLORS.elevated }}>|</span>
+          <button
+            className="footer-link"
+            onClick={() => {
+              setContactSubmitted(false);
+              setContactError(null);
+              setActiveModal('contact');
+            }}
+          >
+            お問い合わせ
+          </button>
+        </div>
+        <div style={{ maxWidth: '720px', margin: '0 auto 16px', padding: '0 20px' }}>
+          <DisclaimerNotice compact />
+        </div>
+        <p style={{ color: COLORS.textDim, fontSize: '13px', margin: 0 }}>
+          © 物件セカンドオピニオン AI Pro All Rights Reserved.
+        </p>
+
+        {IS_DEV && (
+          <div
+            style={{
+              marginTop: '24px',
+              maxWidth: '900px',
+              marginLeft: 'auto',
+              marginRight: 'auto',
+              padding: '16px',
+              borderRadius: '12px',
+              border: '1px dashed #f59e0b',
+              backgroundColor: '#fffbeb',
+              textAlign: 'left',
+            }}
+          >
+            <div style={{ fontSize: '12px', fontWeight: 800, color: '#b45309', marginBottom: '10px' }}>
+              [DEV] ID紐づけテスト（production非表示） — userId={user.userId} / {planStatusLabel}
+              {currentPropertyId ? ` / currentPropertyId=${currentPropertyId}` : ''}
+            </div>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px' }}>
+              <button
+                type="button"
+                onClick={() => applyDevPlan('MONTHLY')}
+                style={{ fontSize: '12px', fontWeight: 700, padding: '8px 12px', borderRadius: '8px', border: '1px solid #93c5fd', background: '#eff6ff', color: '#1d4ed8', cursor: 'pointer' }}
+              >
+                💳 月額PRO会員にする（user.plan=MONTHLY）
+              </button>
+              <button
+                type="button"
+                onClick={purchaseCurrentPropertyForDev}
+                style={{ fontSize: '12px', fontWeight: 700, padding: '8px 12px', borderRadius: '8px', border: '1px solid #86efac', background: '#f0fdf4', color: '#166534', cursor: 'pointer' }}
+              >
+                📄 現在の物件を購入済みにする（purchasedPropertiesへ追加）
+              </button>
+              <button
+                type="button"
+                onClick={() => applyDevPlan('FREE')}
+                style={{ fontSize: '12px', fontWeight: 700, padding: '8px 12px', borderRadius: '8px', border: '1px solid #fecaca', background: '#fef2f2', color: '#b91c1c', cursor: 'pointer' }}
+              >
+                🚫 解約する / 無料会員に戻す（user.plan=FREE）
+              </button>
+              <button
+                type="button"
+                onClick={() => applyDevLoginState(true)}
+                style={{ fontSize: '12px', fontWeight: 700, padding: '8px 12px', borderRadius: '8px', border: '1px solid #c4b5fd', background: '#f5f3ff', color: '#5b21b6', cursor: 'pointer' }}
+              >
+                🔐 ログイン状態にする（isLoggedIn=true）
+              </button>
+              <button
+                type="button"
+                onClick={() => applyDevLoginState(false)}
+                style={{ fontSize: '12px', fontWeight: 700, padding: '8px 12px', borderRadius: '8px', border: '1px solid #fdba74', background: '#fff7ed', color: '#c2410c', cursor: 'pointer' }}
+              >
+                🔓 ログアウト状態にする（isLoggedIn=false）
+              </button>
+            </div>
+            <div style={{ marginTop: '8px', fontSize: '11px', color: '#92400e' }}>
+              isLoggedIn={String(user.isLoggedIn)} / email={user.email || '—'} / authProvider={user.authProvider || '—'}
+            </div>
+          </div>
+        )}
       </footer>
+
+      {/* 8. モーダル */}
+      {activeModal && (
+        <div
+          onClick={() => {
+            setActiveModal(null);
+            setPaywallMessage(null);
+          }}
+          style={{ position: 'fixed', inset: 0, backgroundColor: 'rgba(15, 23, 42, 0.45)', backdropFilter: 'blur(8px)', zIndex: 100, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '20px' }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="modal-animate"
+            style={{ backgroundColor: COLORS.card, border: `1px solid ${COLORS.border}`, borderRadius: '24px', width: '100%', maxWidth: activeModal === 'paywall' || activeModal === 'auth' ? '560px' : '640px', maxHeight: '85vh', display: 'flex', flexDirection: 'column', boxShadow: '0 25px 50px -12px rgba(0, 0, 0, 0.2)' }}
+          >
+            <div style={{ padding: '20px 24px', borderBottom: `1px solid ${COLORS.border}`, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <h3 style={{ margin: 0, fontSize: '18px', fontWeight: 'bold', color: COLORS.text, display: 'flex', alignItems: 'center', gap: '8px' }}>
+                {activeModal === 'terms' && '📜 免責事項'}
+                {activeModal === 'agreement' && '📄 利用規約'}
+                {activeModal === 'tokushoho' && '📄 特定商取引法に基づく表記'}
+                {activeModal === 'privacy' && '🔒 プライバシーポリシー'}
+                {activeModal === 'contact' && '✉️ お問い合わせ'}
+                {activeModal === 'auth' && '🔐 アカウント登録 / ログイン'}
+                {activeModal === 'paywall' && '💎 PROプラン登録'}
+              </h3>
+              <button
+                onClick={() => {
+                  setActiveModal(null);
+                  setPaywallMessage(null);
+                }}
+                style={{ backgroundColor: COLORS.elevated, color: COLORS.textMuted, border: 'none', borderRadius: '50%', width: '32px', height: '32px', fontSize: '16px', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+              >
+                ✕
+              </button>
+            </div>
+
+            <div className="modal-body-scroll" style={{ padding: '24px', overflowY: 'auto', fontSize: '14px', lineHeight: '1.7', color: COLORS.textMuted }}>
+
+              {activeModal === 'terms' && (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
+                  <p style={{ margin: 0, color: COLORS.textMuted }}>
+                    「物件セカンドオピニオン AI」（以下、「当サービス」）のご利用にあたり、以下の免責事項をよくお読みください。当サービスを利用された場合、本内容に同意したものとみなします。
+                  </p>
+                  {[
+                    { t: '1. サービスの目的と情報の正確性', b: '当サービスはAIを活用して物件情報を整理・分析するものであり、宅地建物取引業に基づく正式な査定や法的アドバイスではありません。分析結果の完全性・正確性を保証するものではありません。' },
+                    { t: '2. 投資・契約判断に関する責任', b: 'スコアやリスク分析は参考情報です。実際の不動産購入・賃貸契約等の意思決定は必ずご自身の責任で行い、必要に応じて専門家へご相談ください。損害について運営者は一切責任を負いません。' },
+                    { t: '3. 入力データの取り扱い', b: '入力されたテキストおよび画像は、AIによる解析処理および品質向上のために使用されます。個人を特定できる情報（氏名・電話番号等）の入力はお控えください。' },
+                  ].map((item) => (
+                    <div key={item.t} style={{ backgroundColor: COLORS.cardAlt, padding: '16px', borderRadius: '12px', border: `1px solid ${COLORS.border}` }}>
+                      <h4 style={{ color: COLORS.accentStrong, margin: '0 0 6px 0', fontSize: '14px' }}>{item.t}</h4>
+                      <p style={{ margin: 0, fontSize: '13px', color: COLORS.textDim }}>{item.b}</p>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {activeModal === 'agreement' && (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
+                  <p style={{ margin: 0 }}>本利用規約は、物件セカンドオピニオン AI Pro（以下「本サービス」）の利用条件を定めるものです。</p>
+                  {[
+                    { t: '1. サービスの内容', b: '本サービスはAIによる物件情報の分析・アドバイス提供を目的とします。正式な不動産鑑定や宅建業に基づく媒介行為ではありません。' },
+                    { t: '2. 有料プランと更新', b: 'PRO月額プランは初月割引後、2ヶ月目以降に通常料金が適用されます。解約はマイページからいつでも可能です。自動更新の3日前にリマインドメールを送信します。' },
+                    { t: '3. 禁止事項', b: '不正アクセス、過度な負荷をかける行為、法令・公序良俗に反する利用を禁止します。' },
+                    { t: '4. 規約の変更', b: '必要に応じて本規約を改定する場合があります。重要な変更はサイト上で告知します。' },
+                  ].map((item) => (
+                    <div key={item.t} style={{ backgroundColor: COLORS.cardAlt, padding: '16px', borderRadius: '12px', border: `1px solid ${COLORS.border}` }}>
+                      <h4 style={{ color: COLORS.accentStrong, margin: '0 0 6px 0', fontSize: '14px' }}>{item.t}</h4>
+                      <p style={{ margin: 0, fontSize: '13px', color: COLORS.textDim }}>{item.b}</p>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {activeModal === 'tokushoho' && (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
+                  <p style={{ margin: 0 }}>特定商取引法に基づく表記（デモ表示）</p>
+                  {[
+                    { t: '販売事業者', b: '物件セカンドオピニオン AI Pro 運営（デモ表記）' },
+                    { t: '販売価格', b: '単発プラン：500円（税込）／PRO月額：初月500円、2ヶ月目以降1,980円/月（税込）' },
+                    { t: '支払方法', b: 'クレジットカード（Stripe）' },
+                    { t: '役務の提供時期', b: '決済完了後、直ちにPRO機能をご利用いただけます。' },
+                    { t: '解約・返品', b: 'デジタル役務のため原則返金不可。月額は次回更新日前の解約で以降の課金を停止できます。' },
+                    { t: 'お問い合わせ', b: 'サイト内「お問い合わせ」フォームよりご連絡ください。' },
+                  ].map((item) => (
+                    <div key={item.t} style={{ backgroundColor: COLORS.cardAlt, padding: '16px', borderRadius: '12px', border: `1px solid ${COLORS.border}` }}>
+                      <h4 style={{ color: COLORS.accentStrong, margin: '0 0 6px 0', fontSize: '14px' }}>{item.t}</h4>
+                      <p style={{ margin: 0, fontSize: '13px', color: COLORS.textDim }}>{item.b}</p>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {activeModal === 'privacy' && (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
+                  <p style={{ margin: 0 }}>当サービスは、ユーザーのプライバシーを尊重し、個人情報の保護に努めます。</p>
+                  {[
+                    { t: '1. 取得する情報および利用目的', b: 'AI解析および回答生成のため、入力された物件概要テキストおよび画像データを利用します。また、サービス改善のためアクセスログを自動取得する場合があります。' },
+                    { t: '2. 外部APIへのデータ送信について', b: '物件の高度な解析を行うため、Google LLC等のAIサービス（API）を利用しています。解析に必要なデータのみが送信され、個人が特定される情報は含まれません。' },
+                    { t: '3. 第三者提供の制限', b: '法令に基づく場合を除き、取得した情報を第三者に提供・開示することはありません。' },
+                  ].map((item) => (
+                    <div key={item.t} style={{ backgroundColor: COLORS.cardAlt, padding: '16px', borderRadius: '12px', border: `1px solid ${COLORS.border}` }}>
+                      <h4 style={{ color: COLORS.accentStrong, margin: '0 0 6px 0', fontSize: '14px' }}>{item.t}</h4>
+                      <p style={{ margin: 0, fontSize: '13px', color: COLORS.textDim }}>{item.b}</p>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {activeModal === 'contact' && (
+                <div>
+                  {contactSubmitted ? (
+                    <div style={{ textAlign: 'center', padding: '40px 20px' }}>
+                      <div style={{ fontSize: '48px', marginBottom: '16px' }}>🎉</div>
+                      <h4 style={{ fontSize: '18px', color: COLORS.accentStrong, margin: '0 0 8px 0' }}>送信が完了しました</h4>
+                      <p style={{ color: COLORS.textDim, fontSize: '14px', margin: 0 }}>
+                        お問い合わせいただきありがとうございます。<br />担当者より1〜3営業日以内にご返信いたします。
+                      </p>
+                    </div>
+                  ) : (
+                    <form onSubmit={handleContactSubmit} style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
+                      <div>
+                        <label style={{ display: 'block', fontSize: '12px', color: COLORS.textDim, marginBottom: '6px', fontWeight: 'bold' }}>お名前（任意）</label>
+                        <input type="text" name="name" disabled={contactSubmitting} placeholder="山田 太郎" style={inputStyle} />
+                      </div>
+                      <div>
+                        <label style={{ display: 'block', fontSize: '12px', color: COLORS.textDim, marginBottom: '6px', fontWeight: 'bold' }}>
+                          メールアドレス <span style={{ color: '#ef4444' }}>*</span>
+                        </label>
+                        <input type="email" name="email" required disabled={contactSubmitting} placeholder="your-email@example.com" style={inputStyle} />
+                      </div>
+                      <div>
+                        <label style={{ display: 'block', fontSize: '12px', color: COLORS.textDim, marginBottom: '6px', fontWeight: 'bold' }}>
+                          お問い合わせ種別 <span style={{ color: '#ef4444' }}>*</span>
+                        </label>
+                        <select name="type" required disabled={contactSubmitting} style={inputStyle}>
+                          <option value="サービスの利用方法について">サービスの利用方法について</option>
+                          <option value="PROプラン（有料会員）について">PROプラン（有料会員）について</option>
+                          <option value="不具合・エラーの報告">不具合・エラーの報告</option>
+                          <option value="その他・ご意見ご要望">その他・ご意見ご要望</option>
+                        </select>
+                      </div>
+                      <div>
+                        <label style={{ display: 'block', fontSize: '12px', color: COLORS.textDim, marginBottom: '6px', fontWeight: 'bold' }}>
+                          お問い合わせ内容 <span style={{ color: '#ef4444' }}>*</span>
+                        </label>
+                        <textarea name="message" required rows={4} disabled={contactSubmitting} placeholder="ご自由にご記入ください..." style={{ ...inputStyle, resize: 'vertical' }} />
+                      </div>
+                      {contactError && (
+                        <div style={{ padding: '12px', backgroundColor: '#fef2f2', border: '1px solid #fecaca', color: '#b91c1c', fontSize: '13px', borderRadius: '8px' }}>
+                          ⚠️ {contactError}
+                        </div>
+                      )}
+                      <button
+                        type="submit"
+                        disabled={contactSubmitting}
+                        style={{ marginTop: '8px', backgroundColor: contactSubmitting ? '#94a3b8' : '#2563eb', color: '#ffffff', fontWeight: 'bold', padding: '12px', borderRadius: '8px', border: 'none', cursor: contactSubmitting ? 'not-allowed' : 'pointer', fontSize: '14px' }}
+                      >
+                        {contactSubmitting ? '送信中...' : '送信する'}
+                      </button>
+                    </form>
+                  )}
+                </div>
+              )}
+
+              {activeModal === 'auth' && (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
+                  <p style={{ margin: 0, fontSize: '14px', color: COLORS.textMuted, lineHeight: 1.7 }}>
+                    {authIntent === 'paywall'
+                      ? '決済の前にアカウント登録（またはログイン）が必要です。完了後、顧客ID（userId）が発行され、決済画面へ進みます。'
+                      : 'アカウント登録またはログインで、マイページ・購入履歴・プラン管理をご利用いただけます。'}
+                  </p>
+                  <div
+                    style={{
+                      padding: '12px 14px',
+                      borderRadius: '10px',
+                      background: COLORS.cardAlt,
+                      border: `1px solid ${COLORS.border}`,
+                      fontSize: '12px',
+                      color: COLORS.textDim,
+                    }}
+                  >
+                    {authIntent === 'paywall' && (
+                      <>
+                        選択中プラン: {pendingPayPlan === 'ticket' || selectedPlan === 'ticket' ? '単発500円' : 'PRO月額（初月500円）'}
+                        <br />
+                      </>
+                    )}
+                    現在のID: {user.userId}
+                  </div>
+
+                  <button
+                    type="button"
+                    disabled={authSubmitting}
+                    onClick={handleAuthGoogle}
+                    style={{
+                      width: '100%',
+                      padding: '12px',
+                      borderRadius: '10px',
+                      border: `1px solid ${COLORS.border}`,
+                      background: '#ffffff',
+                      fontWeight: 800,
+                      fontSize: '14px',
+                      cursor: authSubmitting ? 'not-allowed' : 'pointer',
+                      color: COLORS.text,
+                    }}
+                  >
+                    {authSubmitting ? '処理中...' : '🔵 Googleで続ける（デモ）'}
+                  </button>
+
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '10px', color: COLORS.textDim, fontSize: '12px' }}>
+                    <div style={{ flex: 1, height: 1, background: COLORS.border }} />
+                    またはメールアドレス
+                    <div style={{ flex: 1, height: 1, background: COLORS.border }} />
+                  </div>
+
+                  <form onSubmit={handleAuthEmailSubmit} style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
+                    <input
+                      type="email"
+                      required
+                      value={authEmail}
+                      onChange={(e) => setAuthEmail(e.target.value)}
+                      disabled={authSubmitting}
+                      placeholder="your-email@example.com"
+                      style={inputStyle}
+                      autoComplete="email"
+                    />
+                    <button
+                      type="submit"
+                      disabled={authSubmitting}
+                      style={{
+                        background: authSubmitting ? '#94a3b8' : 'linear-gradient(to right, #4f46e5, #2563eb)',
+                        color: '#fff',
+                        border: 'none',
+                        borderRadius: '10px',
+                        padding: '12px',
+                        fontWeight: 800,
+                        cursor: authSubmitting ? 'not-allowed' : 'pointer',
+                        fontSize: '14px',
+                      }}
+                    >
+                      {authSubmitting
+                        ? '認証中...'
+                        : authIntent === 'paywall'
+                          ? 'メールで登録して決済へ進む（デモ）'
+                          : 'メールでログイン / 新規登録（デモ）'}
+                    </button>
+                  </form>
+                  <p style={{ margin: 0, fontSize: '11px', color: COLORS.textDim, textAlign: 'center' }}>
+                    デモ環境です。実Google OAuth / メール送信は行いません。
+                  </p>
+                </div>
+              )}
+
+              {activeModal === 'paywall' && (
+                <div>
+                  {paywallMessage ? (
+                    <div style={{ textAlign: 'center', padding: '28px 12px' }}>
+                      <div style={{ fontSize: '40px', marginBottom: '12px' }}>💳</div>
+                      <h4 style={{ fontSize: '17px', color: COLORS.accentStrong, margin: '0 0 10px 0' }}>
+                        {selectedPlan === 'ticket' ? '単発プランの処理が完了しました' : '決済処理へ進みます'}
+                      </h4>
+                      <p style={{ color: COLORS.textMuted, fontSize: '14px', margin: 0, whiteSpace: 'pre-line' }}>{paywallMessage}</p>
+                      {isProUser && (
+                        <p style={{ margin: '12px 0 0 0', fontSize: '12px', color: COLORS.textDim }}>
+                          マイページ相当：いつでも1クリックで解約できます（デモ表示）
+                        </p>
+                      )}
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setActiveModal(null);
+                          setPaywallMessage(null);
+                        }}
+                        style={{ marginTop: '20px', backgroundColor: '#2563eb', color: '#ffffff', fontWeight: 'bold', padding: '10px 24px', borderRadius: '8px', border: 'none', cursor: 'pointer', fontSize: '14px' }}
+                      >
+                        閉じる
+                      </button>
+                    </div>
+                  ) : (
+                    <form onSubmit={handlePaywallSubmit} style={{ display: 'flex', flexDirection: 'column', gap: '18px' }}>
+                      <p style={{ margin: 0, fontSize: '13px', color: COLORS.textDim }}>
+                        無料枠を使い切ったあとも、無制限に診断できるプランをご用意しています。
+                      </p>
+                      {isProUser && (
+                        <div style={{ padding: '12px 14px', borderRadius: '10px', backgroundColor: '#f0fdf4', border: '1px solid #bbf7d0', color: '#166534', fontSize: '13px', lineHeight: 1.6 }}>
+                          現在は月額PRO会員です。解約・お支払い方法の変更はStripeの契約管理ページから行えます。
+                          <div style={{ marginTop: '8px' }}>
+                            <button
+                              type="button"
+                              onClick={() => cancelSubscriptionToFree()}
+                              disabled={paywallSubmitting}
+                              style={{ fontSize: '12px', fontWeight: 700, color: '#b91c1c', background: '#fff', border: '1px solid #fecaca', borderRadius: '8px', padding: '6px 10px', cursor: paywallSubmitting ? 'not-allowed' : 'pointer' }}
+                            >
+                              Stripeで解約・契約管理を開く
+                            </button>
+                          </div>
+                        </div>
+                      )}
+
+                      <div>
+                        <label style={{ display: 'block', fontSize: '12px', color: COLORS.textDim, marginBottom: '8px', fontWeight: 'bold' }}>
+                          プラン選択 <span style={{ color: '#ef4444' }}>*</span>
+                        </label>
+                        <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap' }}>
+                          <button type="button" onClick={() => setSelectedPlan('ticket')} style={planCardStyle(selectedPlan === 'ticket')}>
+                            <div style={{ fontSize: '12px', color: COLORS.textDim, marginBottom: '4px' }}>【単発プラン】</div>
+                            <div style={{ fontWeight: 800, fontSize: '15px' }}>500円 / 1物件診断</div>
+                            <div style={{ marginTop: '6px', fontSize: '12px', color: COLORS.textMuted, lineHeight: 1.5 }}>
+                              買い切り・自動更新なし（この物件のPRO機能を解放）
+                            </div>
+                          </button>
+                          <button type="button" onClick={() => setSelectedPlan('pro')} style={planCardStyle(selectedPlan === 'pro')}>
+                            <div style={{ fontSize: '12px', color: COLORS.textDim, marginBottom: '4px' }}>【PRO月額プラン】</div>
+                            <div style={{ fontWeight: 800, fontSize: '15px', color: COLORS.accentStrong }}>1,980円 / 月</div>
+                            <div style={{ marginTop: '6px', fontSize: '12px', color: COLORS.textMuted, lineHeight: 1.5 }}>
+                              全物件のPRO機能を解放・いつでも解約可能
+                            </div>
+                          </button>
+                        </div>
+                        {selectedPlan === 'pro' && (
+                          <p style={{ margin: '10px 0 0 0', fontSize: '12px', color: COLORS.accentStrong, fontWeight: 700 }}>
+                            ご請求：1,980円/月（クレジットカード / Stripe Checkout）
+                          </p>
+                        )}
+                        {selectedPlan === 'ticket' && (
+                          <p style={{ margin: '10px 0 0 0', fontSize: '12px', color: COLORS.textMuted }}>
+                            現在の物件キー: {currentPropertyId || (inputText.trim() ? buildPropertyId(inputText) : '（解析後に確定）')}
+                          </p>
+                        )}
+                      </div>
+
+                      <div>
+                        <label style={{ display: 'block', fontSize: '12px', color: COLORS.textDim, marginBottom: '6px', fontWeight: 'bold' }}>
+                          お支払い方法
+                        </label>
+                        <div style={{ padding: '12px 14px', borderRadius: '10px', border: `1px solid ${COLORS.border}`, backgroundColor: COLORS.cardAlt, fontSize: '13px', fontWeight: 700, color: COLORS.text }}>
+                          💳 クレジットカード（Visa / Master / JCB等）・Stripe Checkoutへ遷移します
+                        </div>
+                      </div>
+
+                      <div>
+                        <label style={{ display: 'block', fontSize: '12px', color: COLORS.textDim, marginBottom: '6px', fontWeight: 'bold' }}>
+                          メールアドレス <span style={{ color: '#ef4444' }}>*</span>
+                        </label>
+                        <input
+                          type="email"
+                          required
+                          value={paywallEmail}
+                          onChange={(e) => setPaywallEmail(e.target.value)}
+                          disabled={paywallSubmitting}
+                          placeholder="billing@example.com"
+                          style={inputStyle}
+                          autoComplete="email"
+                        />
+                      </div>
+
+                      <div style={{ padding: '12px 14px', borderRadius: '10px', backgroundColor: '#eff6ff', border: '1px solid #bfdbfe', fontSize: '12px', color: '#1e40af', lineHeight: 1.6 }}>
+                        「今すぐ購入 / 登録」を押すと Stripe の安全な決済ページへ移動します。カード情報の入力は Stripe 上で行います。
+                      </div>
+
+                      <button
+                        type="submit"
+                        disabled={paywallSubmitting}
+                        style={{
+                          marginTop: '4px',
+                          background: paywallSubmitting ? '#94a3b8' : 'linear-gradient(to right, #4f46e5, #2563eb)',
+                          color: '#ffffff',
+                          fontWeight: 800,
+                          padding: '14px',
+                          borderRadius: '10px',
+                          border: 'none',
+                          cursor: paywallSubmitting ? 'not-allowed' : 'pointer',
+                          fontSize: '15px',
+                        }}
+                      >
+                        {paywallSubmitting
+                          ? 'Stripeへ移動中...'
+                          : selectedPlan === 'ticket'
+                            ? '今すぐ単発プランを購入（Stripe）'
+                            : '今すぐPRO月額に登録（Stripe）'}
+                      </button>
+
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', fontSize: '11px', color: COLORS.textDim, lineHeight: 1.65 }}>
+                        <p style={{ margin: 0 }}>
+                          🔒 いつでもマイページから1クリックで解約可能（自動更新の3日前にリマインドメールをお届けします）
+                        </p>
+                        <p style={{ margin: 0 }}>
+                          🛡️ クレジットカード情報はStripe（世界標準の決済システム）により安全に保護されます
+                        </p>
+                        <p style={{ margin: 0, textAlign: 'center' }}>
+                          📄{' '}
+                          <button type="button" className="footer-link" onClick={() => setActiveModal('agreement')} style={{ padding: 0, fontSize: '11px', color: COLORS.accent, textDecoration: 'underline' }}>
+                            利用規約
+                          </button>
+                          {'　／　'}
+                          <button type="button" className="footer-link" onClick={() => setActiveModal('tokushoho')} style={{ padding: 0, fontSize: '11px', color: COLORS.accent, textDecoration: 'underline' }}>
+                            特定商取引法に基づく表記
+                          </button>
+                        </p>
+                        <p style={{ margin: '4px 0 0 0', textAlign: 'center' }}>
+                          デモ環境です。実カード情報は送信されず、課金も発生しません。
+                        </p>
+                      </div>
+                    </form>
+                  )}
+                </div>
+              )}
+
+            </div>
+
+            {activeModal !== 'paywall' && activeModal !== 'auth' && (
+              <div style={{ padding: '16px 24px', borderTop: `1px solid ${COLORS.border}`, textAlign: 'right' }}>
+                <button
+                  onClick={() => setActiveModal(null)}
+                  style={{ backgroundColor: COLORS.elevated, color: '#ffffff', border: 'none', padding: '8px 20px', borderRadius: '8px', fontSize: '13px', fontWeight: 'bold', cursor: 'pointer' }}
+                >
+                  閉じる
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
