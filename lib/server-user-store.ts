@@ -26,37 +26,83 @@ type StoreFile = {
   users: Record<string, ServerUserRecord>;
 };
 
-const STORE_DIR = path.join(process.cwd(), 'data');
-const STORE_PATH = path.join(STORE_DIR, 'stripe-users.json');
+/** Vercel / Lambda はプロジェクトルートが読み取り専用 */
+function isServerlessRuntime(): boolean {
+  return !!(process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME);
+}
+
+function getStorePaths(): { dir: string; file: string } {
+  if (isServerlessRuntime()) {
+    // Vercel / Lambda では書き込み可能な /tmp のみ使用
+    const dir = '/tmp/data';
+    return { dir, file: '/tmp/data/stripe-users.json' };
+  }
+  // ローカル開発: プロジェクト配下 data/（NFT トレース除外）
+  const dir = path.join(/*turbopackIgnore: true*/ process.cwd(), 'data');
+  return { dir, file: path.join(dir, 'stripe-users.json') };
+}
+
+/** 同一インスタンス内のフォールバック（fs失敗時・コールドスタート間は揮発） */
+let memoryStore: StoreFile | null = null;
 
 function emptyStore(): StoreFile {
   return { users: {} };
 }
 
+function cloneStore(store: StoreFile): StoreFile {
+  return JSON.parse(JSON.stringify(store)) as StoreFile;
+}
+
 async function ensureStore(): Promise<void> {
-  await fs.mkdir(STORE_DIR, { recursive: true });
+  const { dir, file } = getStorePaths();
   try {
-    await fs.access(STORE_PATH);
-  } catch {
-    await fs.writeFile(STORE_PATH, JSON.stringify(emptyStore(), null, 2), 'utf8');
+    await fs.mkdir(dir, { recursive: true });
+    try {
+      await fs.access(file);
+    } catch {
+      await fs.writeFile(file, JSON.stringify(emptyStore(), null, 2), 'utf8');
+    }
+  } catch (err) {
+    console.warn('[server-user-store] ensureStore failed; using in-memory fallback:', err);
+    if (!memoryStore) memoryStore = emptyStore();
   }
 }
 
 async function readStore(): Promise<StoreFile> {
+  if (memoryStore) {
+    // メモリ優先（同一インスタンスでの一貫性）
+    // /tmp からも読み込み、より新しい方を採用したいが簡易実装ではメモリを優先
+    return cloneStore(memoryStore);
+  }
+
   await ensureStore();
+  const { file } = getStorePaths();
   try {
-    const raw = await fs.readFile(STORE_PATH, 'utf8');
+    const raw = await fs.readFile(file, 'utf8');
     const parsed = JSON.parse(raw) as StoreFile;
-    if (!parsed || typeof parsed !== 'object' || !parsed.users) return emptyStore();
-    return parsed;
+    if (!parsed || typeof parsed !== 'object' || !parsed.users) {
+      memoryStore = emptyStore();
+      return cloneStore(memoryStore);
+    }
+    memoryStore = parsed;
+    return cloneStore(parsed);
   } catch {
-    return emptyStore();
+    if (!memoryStore) memoryStore = emptyStore();
+    return cloneStore(memoryStore);
   }
 }
 
 async function writeStore(store: StoreFile): Promise<void> {
-  await ensureStore();
-  await fs.writeFile(STORE_PATH, JSON.stringify(store, null, 2), 'utf8');
+  memoryStore = cloneStore(store);
+
+  const { dir, file } = getStorePaths();
+  try {
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(file, JSON.stringify(store, null, 2), 'utf8');
+  } catch (err) {
+    // Vercel で書き込み不能でも API は落とさない（メモリで継続）
+    console.warn('[server-user-store] writeStore failed; kept in-memory only:', err);
+  }
 }
 
 function createDefaultRecord(userId: string): ServerUserRecord {
