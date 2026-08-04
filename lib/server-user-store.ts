@@ -1,5 +1,4 @@
 import { promises as fs } from 'fs';
-import path from 'path';
 import type { HouseholdType, PropertyType, PurchasedPropertyRecord, UserPlan } from '@/lib/plan';
 
 export type ServerPurchasedProperty = {
@@ -27,37 +26,14 @@ type StoreFile = {
 };
 
 /**
- * Vercel / Lambda / 本番ではプロジェクトルート（例: /var/task）が読み取り専用。
- * cwd 配下の data/ へは絶対に書かない。
+ * 注意:
+ * - Vercel の cwd は /var/task（読み取り専用）のため、絶対に process.cwd()/data へ書かない
+ * - ディスク書き込みは常に /tmp 配下のみ（失敗時はメモリのみで継続）
  */
-function useEphemeralFs(): boolean {
-  if (process.env.VERCEL) return true;
-  if (process.env.VERCEL_ENV) return true;
-  if (process.env.AWS_LAMBDA_FUNCTION_NAME) return true;
-  if (process.env.NODE_ENV === 'production') return true;
-  try {
-    const cwd = process.cwd();
-    if (cwd.startsWith('/var/task') || cwd.startsWith('/vercel')) return true;
-  } catch {
-    return true;
-  }
-  return false;
-}
+const TMP_DIR = '/tmp/bukken-ai-data';
+const TMP_FILE = '/tmp/bukken-ai-data/stripe-users.json';
 
-/** 書き込み先は /tmp のみ（ローカル開発時のみプロジェクト配下） */
-function getStorePaths(): { dir: string; file: string } | null {
-  if (useEphemeralFs()) {
-    return { dir: '/tmp/bukken-ai-data', file: '/tmp/bukken-ai-data/stripe-users.json' };
-  }
-  try {
-    const dir = path.join(/*turbopackIgnore: true*/ process.cwd(), 'data');
-    return { dir, file: path.join(dir, 'stripe-users.json') };
-  } catch {
-    return { dir: '/tmp/bukken-ai-data', file: '/tmp/bukken-ai-data/stripe-users.json' };
-  }
-}
-
-/** 同一インスタンス内の正本（Serverless ではこれが主ストレージ） */
+/** 同一インスタンス内の正本 */
 let memoryStore: StoreFile = { users: {} };
 let memoryHydrated = false;
 
@@ -69,11 +45,9 @@ function cloneStore(store: StoreFile): StoreFile {
   return JSON.parse(JSON.stringify(store)) as StoreFile;
 }
 
-async function tryReadFromDisk(): Promise<StoreFile | null> {
-  const paths = getStorePaths();
-  if (!paths) return null;
+async function tryReadFromTmp(): Promise<StoreFile | null> {
   try {
-    const raw = await fs.readFile(paths.file, 'utf8');
+    const raw = await fs.readFile(TMP_FILE, 'utf8');
     const parsed = JSON.parse(raw) as StoreFile;
     if (!parsed || typeof parsed !== 'object' || !parsed.users) return null;
     return parsed;
@@ -82,24 +56,20 @@ async function tryReadFromDisk(): Promise<StoreFile | null> {
   }
 }
 
-async function tryWriteToDisk(store: StoreFile): Promise<void> {
-  const paths = getStorePaths();
-  if (!paths) return;
+async function tryWriteToTmp(store: StoreFile): Promise<void> {
   try {
-    await fs.mkdir(paths.dir, { recursive: true });
-    await fs.writeFile(paths.file, JSON.stringify(store, null, 2), 'utf8');
+    await fs.mkdir(TMP_DIR, { recursive: true });
+    await fs.writeFile(TMP_FILE, JSON.stringify(store, null, 2), 'utf8');
   } catch (err) {
-    // 読み取り専用FS・ENOENT 等でも絶対に throw しない
-    console.warn('[server-user-store] disk write skipped:', err);
+    // ENOENT / EACCES 等でも throw しない（メモリ保持で継続）
+    console.warn('[server-user-store] /tmp write skipped:', err);
   }
 }
 
 async function readStore(): Promise<StoreFile> {
   if (!memoryHydrated) {
-    const fromDisk = await tryReadFromDisk();
-    if (fromDisk) {
-      memoryStore = fromDisk;
-    }
+    const fromDisk = await tryReadFromTmp();
+    if (fromDisk) memoryStore = fromDisk;
     memoryHydrated = true;
   }
   return cloneStore(memoryStore);
@@ -108,8 +78,7 @@ async function readStore(): Promise<StoreFile> {
 async function writeStore(store: StoreFile): Promise<void> {
   memoryStore = cloneStore(store);
   memoryHydrated = true;
-  // best-effort のみ。失敗してもメモリ上の権利情報は保持
-  await tryWriteToDisk(store);
+  await tryWriteToTmp(store);
 }
 
 function createDefaultRecord(userId: string): ServerUserRecord {
