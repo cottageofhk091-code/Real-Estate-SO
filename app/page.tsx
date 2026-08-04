@@ -301,6 +301,8 @@ export default function Home() {
   const [paywallEmail, setPaywallEmail] = useState('');
   const [paywallSubmitting, setPaywallSubmitting] = useState(false);
   const [paywallMessage, setPaywallMessage] = useState<string | null>(null);
+  const [stripeTestLoading, setStripeTestLoading] = useState<'SINGLE' | 'MONTHLY' | null>(null);
+  const [stripeTestError, setStripeTestError] = useState<string | null>(null);
   const analyzeAbortRef = useRef<AbortController | null>(null);
   const analyzeTimedOutRef = useRef(false);
   const chatAbortRef = useRef<AbortController | null>(null);
@@ -1031,6 +1033,54 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
     }
   };
 
+  /** DEV専用: ログイン不要で Stripe Checkout へ遷移するテスト */
+  const startStripeCheckoutTest = async (planType: 'SINGLE' | 'MONTHLY') => {
+    if (!IS_DEV) return;
+    setStripeTestLoading(planType);
+    setStripeTestError(null);
+
+    const testUserId = user.userId || 'user_stripe_test_local';
+    const testEmail = user.email || 'stripe-test@example.com';
+    const testPropertyId =
+      currentPropertyId ||
+      (inputText.trim() ? buildPropertyId(inputText) : 'prop_stripe_test_local');
+
+    try {
+      const res = await fetch('/api/checkout', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          planType,
+          userId: testUserId,
+          email: testEmail,
+          propertyId: planType === 'SINGLE' ? testPropertyId : undefined,
+          propertySnapshot:
+            planType === 'SINGLE'
+              ? {
+                  propertyId: testPropertyId,
+                  title: 'Stripeローカル決済テスト物件',
+                  locationOrUrl: 'https://example.com/stripe-test',
+                  householdType,
+                  propertyType,
+                  sourceText: inputText || 'Stripe checkout local test',
+                }
+              : undefined,
+        }),
+      });
+
+      const data = await res.json();
+      if (!res.ok || !data.url) {
+        throw new Error(data.error || 'Checkout Session の作成に失敗しました。');
+      }
+
+      window.location.href = data.url as string;
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : 'Stripe決済テストの開始に失敗しました。';
+      setStripeTestError(message);
+      setStripeTestLoading(null);
+    }
+  };
+
   const handlePaywallSubmit = async (e: FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     setPaywallSubmitting(true);
@@ -1526,6 +1576,75 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
           </div>
         </div>
       </header>
+
+      {IS_DEV && (
+        <div
+          style={{
+            maxWidth: '1000px',
+            margin: '0 auto',
+            padding: '12px 20px 0',
+          }}
+        >
+          <div
+            style={{
+              padding: '14px 16px',
+              borderRadius: '12px',
+              border: '1px dashed #635bff',
+              background: 'linear-gradient(90deg, #f5f3ff 0%, #eff6ff 100%)',
+              display: 'flex',
+              flexWrap: 'wrap',
+              gap: '10px',
+              alignItems: 'center',
+            }}
+          >
+            <span style={{ fontSize: '12px', fontWeight: 800, color: '#4f46e5' }}>
+              [DEV] Stripe決済テスト（ログイン不要）
+            </span>
+            <button
+              type="button"
+              disabled={!!stripeTestLoading}
+              onClick={() => void startStripeCheckoutTest('SINGLE')}
+              style={{
+                fontSize: '12px',
+                fontWeight: 800,
+                padding: '8px 14px',
+                borderRadius: '8px',
+                border: '1px solid #a5b4fc',
+                background: stripeTestLoading === 'SINGLE' ? '#c7d2fe' : '#ffffff',
+                color: '#3730a3',
+                cursor: stripeTestLoading ? 'not-allowed' : 'pointer',
+              }}
+            >
+              {stripeTestLoading === 'SINGLE' ? 'リダイレクト中...' : '💳 単発500円 Checkout を開く'}
+            </button>
+            <button
+              type="button"
+              disabled={!!stripeTestLoading}
+              onClick={() => void startStripeCheckoutTest('MONTHLY')}
+              style={{
+                fontSize: '12px',
+                fontWeight: 800,
+                padding: '8px 14px',
+                borderRadius: '8px',
+                border: '1px solid #86efac',
+                background: stripeTestLoading === 'MONTHLY' ? '#bbf7d0' : '#ffffff',
+                color: '#166534',
+                cursor: stripeTestLoading ? 'not-allowed' : 'pointer',
+              }}
+            >
+              {stripeTestLoading === 'MONTHLY' ? 'リダイレクト中...' : '🔁 月額1,980円 Checkout を開く'}
+            </button>
+            <span style={{ fontSize: '11px', color: COLORS.textDim }}>
+              → checkout.stripe.com へ遷移（テストカード: 4242…）
+            </span>
+            {stripeTestError && (
+              <div style={{ width: '100%', fontSize: '12px', color: '#b91c1c', fontWeight: 700 }}>
+                ⚠️ {stripeTestError}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* 2. ヒーローセクション */}
       <section style={{ textAlign: 'center', padding: '60px 20px 40px', background: 'radial-gradient(circle at top, rgba(37, 99, 235, 0.08) 0%, rgba(248, 250, 252, 0) 70%)' }}>
@@ -2284,16 +2403,34 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
 
               {activeModal === 'agreement' && (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
-                  <p style={{ margin: 0 }}>本利用規約は、物件セカンドオピニオン AI Pro（以下「本サービス」）の利用条件を定めるものです。</p>
+                  <p style={{ margin: 0, lineHeight: 1.7 }}>
+                    本利用規約は、物件セカンドオピニオン AI Pro（以下「本サービス」）の利用条件を定めるものです。
+                  </p>
                   {[
-                    { t: '1. サービスの内容', b: '本サービスはAIによる物件情報の分析・アドバイス提供を目的とします。正式な不動産鑑定や宅建業に基づく媒介行為ではありません。' },
-                    { t: '2. 有料プランと更新', b: 'PRO月額プランは初月割引後、2ヶ月目以降に通常料金が適用されます。解約はマイページからいつでも可能です。自動更新の3日前にリマインドメールを送信します。' },
-                    { t: '3. 禁止事項', b: '不正アクセス、過度な負荷をかける行為、法令・公序良俗に反する利用を禁止します。' },
-                    { t: '4. 規約の変更', b: '必要に応じて本規約を改定する場合があります。重要な変更はサイト上で告知します。' },
+                    {
+                      t: '1. サービスの内容と免責事項',
+                      b: '本サービスはAI（人工知能）による物件情報の自動分析・アドバイス提供を目的とするものであり、宅地建物取引業に基づく媒介行為、正式な不動産鑑定、または投資の勧誘を行うものではありません。AIによる分析結果の正確性・完全性・最新性について保証するものではなく、本サービスの利用結果に基づいて生じた損害や損失について、運営者は一切の責任を負いません。不動産の売買や投資の最終決定は、利用者ご自身の責任において行ってください。',
+                    },
+                    {
+                      t: '2. 有料プラン・購入および支払い',
+                      b: '（1）本サービスの利用料金（単発分析、PRO月額プラン等）は、サイト上に表示される価格とします。\n（2）お支払い方法は、Stripe Payments Japan合同会社が提供する決済システムを通じたクレジットカード決済等によるものとします。\n（3）デジタルコンテンツおよびサービスの性質上、購入・決済完了後の返金・返品・キャンセルには理由を問わず一切応じられません。',
+                    },
+                    {
+                      t: '3. 月額プランの自動更新と解約',
+                      b: 'PRO月額プランは、解約手続きが行われない限り自動的に更新され、月額料金が課金されます。解約はマイページよりいつでも手続きが可能です。解約手続きを行った場合でも、すでに支払われた利用料金の返金（日割り計算含む）は行われません。',
+                    },
+                    {
+                      t: '4. 禁止事項',
+                      b: '以下の行為を禁止します。\n・不正アクセス、またはサーバーに過度な負荷をかける行為\n・本サービスの分析結果を営利目的で第三者に再販売・転載する行為\n・法令、公序良俗に反する利用行為',
+                    },
+                    {
+                      t: '5. 規約の変更',
+                      b: '運営者は、必要に応じて本規約を改定することができるものとします。重要な変更を行う場合は、サイト上での掲載その他適切な方法により事前に告知します。',
+                    },
                   ].map((item) => (
                     <div key={item.t} style={{ backgroundColor: COLORS.cardAlt, padding: '16px', borderRadius: '12px', border: `1px solid ${COLORS.border}` }}>
                       <h4 style={{ color: COLORS.accentStrong, margin: '0 0 6px 0', fontSize: '14px' }}>{item.t}</h4>
-                      <p style={{ margin: 0, fontSize: '13px', color: COLORS.textDim }}>{item.b}</p>
+                      <p style={{ margin: 0, fontSize: '13px', color: COLORS.textDim, whiteSpace: 'pre-line', lineHeight: 1.7 }}>{item.b}</p>
                     </div>
                   ))}
                 </div>
@@ -2301,18 +2438,43 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
 
               {activeModal === 'tokushoho' && (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
-                  <p style={{ margin: 0 }}>特定商取引法に基づく表記（デモ表示）</p>
+                  <p style={{ margin: 0, lineHeight: 1.7 }}>特定商取引法に基づく表記</p>
                   {[
-                    { t: '販売事業者', b: '物件セカンドオピニオン AI Pro 運営（デモ表記）' },
-                    { t: '販売価格', b: '単発プラン：500円（税込）／PRO月額：初月500円、2ヶ月目以降1,980円/月（税込）' },
-                    { t: '支払方法', b: 'クレジットカード（Stripe）' },
-                    { t: '役務の提供時期', b: '決済完了後、直ちにPRO機能をご利用いただけます。' },
-                    { t: '解約・返品', b: 'デジタル役務のため原則返金不可。月額は次回更新日前の解約で以降の課金を停止できます。' },
-                    { t: 'お問い合わせ', b: 'サイト内「お問い合わせ」フォームよりご連絡ください。' },
+                    { t: '■ 販売事業者名', b: '物件セカンドオピニオン AI Pro 運営事務局' },
+                    { t: '■ 運営責任者', b: 'Hiroki Matsushita' },
+                    {
+                      t: '■ 所在地・電話番号',
+                      b: 'お問い合わせ先メールアドレスまたはお問い合わせフォームにてご請求いただければ、遅滞なく開示いたします。',
+                    },
+                    {
+                      t: '■ お問い合わせ先',
+                      b: 'サイト内「お問い合わせ」フォームよりご連絡ください。\n（メールアドレス等の詳細情報は、ご請求いただければ遅滞なく開示いたします）',
+                    },
+                    {
+                      t: '■ 販売価格',
+                      b: '・単発プラン：500円（税込）\n・PRO月額プラン：初月500円（税込）、2ヶ月目以降 1,980円/月（税込）',
+                    },
+                    {
+                      t: '■ 商品代金以外の必要料金',
+                      b: 'インターネット接続料金および通信手数料（お客様のご負担となります）。',
+                    },
+                    { t: '■ 支払方法', b: 'クレジットカード決済（Stripe）' },
+                    {
+                      t: '■ 支払時期',
+                      b: '・単発プラン：ご注文時（即時決済）\n・PRO月額プラン：初回購入時、および翌月以降の自動更新日に即時決済',
+                    },
+                    {
+                      t: '■ 役務の提供時期',
+                      b: '決済完了後、直ちに対象のPRO機能・分析機能をご利用いただけます。',
+                    },
+                    {
+                      t: '■ 返品・返金・キャンセルについて',
+                      b: 'デジタル役務の性質上、決済完了後の返金・返品・途中解約による日割り返金には原則として応じられません。\n月額プランの解約は、次回更新日までにマイページより手続きを行っていただくことで、次回以降の課金を停止できます。',
+                    },
                   ].map((item) => (
                     <div key={item.t} style={{ backgroundColor: COLORS.cardAlt, padding: '16px', borderRadius: '12px', border: `1px solid ${COLORS.border}` }}>
                       <h4 style={{ color: COLORS.accentStrong, margin: '0 0 6px 0', fontSize: '14px' }}>{item.t}</h4>
-                      <p style={{ margin: 0, fontSize: '13px', color: COLORS.textDim }}>{item.b}</p>
+                      <p style={{ margin: 0, fontSize: '13px', color: COLORS.textDim, whiteSpace: 'pre-line', lineHeight: 1.7 }}>{item.b}</p>
                     </div>
                   ))}
                 </div>
@@ -2320,15 +2482,34 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
 
               {activeModal === 'privacy' && (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
-                  <p style={{ margin: 0 }}>当サービスは、ユーザーのプライバシーを尊重し、個人情報の保護に努めます。</p>
+                  <p style={{ margin: 0, lineHeight: 1.7 }}>
+                    当サービス（物件セカンドオピニオン AI Pro）は、ユーザーのプライバシーを尊重し、個人情報の保護に努めます。
+                  </p>
                   {[
-                    { t: '1. 取得する情報および利用目的', b: 'AI解析および回答生成のため、入力された物件概要テキストおよび画像データを利用します。また、サービス改善のためアクセスログを自動取得する場合があります。' },
-                    { t: '2. 外部APIへのデータ送信について', b: '物件の高度な解析を行うため、Google LLC等のAIサービス（API）を利用しています。解析に必要なデータのみが送信され、個人が特定される情報は含まれません。' },
-                    { t: '3. 第三者提供の制限', b: '法令に基づく場合を除き、取得した情報を第三者に提供・開示することはありません。' },
+                    {
+                      t: '1. 取得する情報および利用目的',
+                      b: '当サービスでは、以下の情報を取得・利用します。\n・AI解析および回答生成のため：入力された物件概要テキスト、画像データ\n・決済処理のため：メールアドレス、決済識別情報\n・サービス改善・不正防止のため：アクセスログ、IPアドレス、クッキー（Cookie）情報',
+                    },
+                    {
+                      t: '2. 外部APIへのデータ送信について',
+                      b: '物件の高度な解析を行うため、Google LLC等の提供する外部AIサービス（API）を利用しています。送信されるデータは解析に必要な物件情報等であり、お客様の氏名やクレジットカード情報等の個人を特定する情報は含まれません。',
+                    },
+                    {
+                      t: '3. 決済処理における第三者提供（Stripe社への提供）',
+                      b: '当サービスでは、クレジットカード決済処理のために決済代行会社「Stripe Payments Japan合同会社」およびその関連会社（米国等）の決済システムを利用しています。\n決済手続きの際、お客様のクレジットカード情報・メールアドレス等はStripe社のサーバーに直接送信・保護され、当サービスのサーバーにはクレジットカード情報は一切保持されません。',
+                    },
+                    {
+                      t: '4. 第三者提供の制限',
+                      b: '前項の決済代行業者への委託および法令に基づく場合を除き、取得した個人情報をユーザーの同意なく第三者に提供・開示することはありません。',
+                    },
+                    {
+                      t: '5. お問い合わせ窓口',
+                      b: '個人情報の取り扱いに関するお問い合わせは、サイト内のお問い合わせフォームよりご連絡ください。',
+                    },
                   ].map((item) => (
                     <div key={item.t} style={{ backgroundColor: COLORS.cardAlt, padding: '16px', borderRadius: '12px', border: `1px solid ${COLORS.border}` }}>
                       <h4 style={{ color: COLORS.accentStrong, margin: '0 0 6px 0', fontSize: '14px' }}>{item.t}</h4>
-                      <p style={{ margin: 0, fontSize: '13px', color: COLORS.textDim }}>{item.b}</p>
+                      <p style={{ margin: 0, fontSize: '13px', color: COLORS.textDim, whiteSpace: 'pre-line', lineHeight: 1.7 }}>{item.b}</p>
                     </div>
                   ))}
                 </div>
