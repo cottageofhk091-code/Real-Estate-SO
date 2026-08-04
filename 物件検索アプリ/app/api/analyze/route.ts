@@ -1,5 +1,38 @@
 import { GoogleGenAI } from "@google/genai";
 import { NextRequest, NextResponse } from "next/server";
+import fs from "node:fs";
+import fsp from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+
+// Vercel で依存ライブラリが /var/task/data へ mkdir しても落ちないようリマップ
+(() => {
+  if (!(process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME)) return;
+  const safeRoot = path.join(os.tmpdir(), "bukken-ai");
+  const remap = (input: fs.PathLike): string => {
+    const raw = typeof input === "string" ? input : input.toString();
+    const n = raw.replace(/\\/g, "/");
+    if (
+      n === "data" ||
+      n === "./data" ||
+      n.endsWith("/data") ||
+      n.includes("/var/task/data") ||
+      /(^|\/)data(\/|$)/.test(n)
+    ) {
+      return path.join(safeRoot, "data");
+    }
+    if (n.startsWith("/var/task/")) {
+      return path.join(safeRoot, n.slice("/var/task/".length));
+    }
+    return raw;
+  };
+  const origMkdir = fsp.mkdir.bind(fsp);
+  (fsp as { mkdir: typeof fsp.mkdir }).mkdir = ((p, opts) =>
+    origMkdir(remap(p as fs.PathLike), opts as never)) as typeof fsp.mkdir;
+  const origMkdirSync = fs.mkdirSync.bind(fs);
+  fs.mkdirSync = ((p, opts) =>
+    origMkdirSync(remap(p as fs.PathLike), opts)) as typeof fs.mkdirSync;
+})();
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";

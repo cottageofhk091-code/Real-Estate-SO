@@ -1,3 +1,4 @@
+import '@/lib/vercel-fs-guard-init';
 import { NextResponse } from 'next/server';
 import { GEMINI_ANALYZE_MODELS, generateGeminiContentWithFallback } from '@/lib/gemini';
 
