@@ -1,4 +1,7 @@
 import { GoogleGenerativeAI, type GenerateContentResult } from '@google/generative-ai';
+import { installVercelFsGuard, isFilesystemError } from '@/lib/vercel-fs-guard';
+
+installVercelFsGuard();
 
 /**
  * Gemini モデル定数
@@ -7,6 +10,7 @@ import { GoogleGenerativeAI, type GenerateContentResult } from '@google/generati
  * - gemini-1.5-* / gemini-2.0-* はシャットダウン済み（v1beta で 404）
  * - gemini-2.5-pro は新規ユーザー向けに提供されない場合がある
  * - モデル名は必ず "gemini-..." のみ（"models/" 接頭辞なし）
+ * - このモジュールではローカルファイルへの保存（fs）は行わない
  */
 export const GEMINI_ANALYZE_MODEL = 'gemini-2.5-flash';
 export const GEMINI_CHAT_MODEL = 'gemini-2.5-flash';
@@ -67,6 +71,8 @@ export async function generateGeminiContent({
   images = [],
   generationConfig,
 }: GenerateParams): Promise<string> {
+  installVercelFsGuard();
+
   const genAI = createGeminiClient();
   const modelId = normalizeGeminiModelId(model);
 
@@ -76,12 +82,20 @@ export async function generateGeminiContent({
   });
 
   const parts: Array<string | InlineImage> = [prompt, ...images];
-  const result: GenerateContentResult = await generativeModel.generateContent(parts);
-  const text = result.response.text();
-  if (!text) {
-    throw new Error(`モデル ${modelId} から空のレスポンスが返されました。`);
+
+  try {
+    const result: GenerateContentResult = await generativeModel.generateContent(parts);
+    const text = result.response.text();
+    if (!text) {
+      throw new Error(`モデル ${modelId} から空のレスポンスが返されました。`);
+    }
+    return text;
+  } catch (error: unknown) {
+    if (isFilesystemError(error)) {
+      console.warn('FS write skipped (generateGeminiContent)', error);
+    }
+    throw error;
   }
-  return text;
 }
 
 /** 候補モデルを順に試し、最初に成功した応答を返す */
@@ -89,6 +103,7 @@ export async function generateGeminiContentWithFallback(
   models: readonly string[],
   params: Omit<GenerateParams, 'model'>
 ): Promise<string> {
+  installVercelFsGuard();
   let lastError: unknown = null;
 
   for (const model of models) {
@@ -97,6 +112,9 @@ export async function generateGeminiContentWithFallback(
     } catch (err) {
       lastError = err;
       console.warn(`[Gemini] model failed: ${normalizeGeminiModelId(model)}`, err);
+      if (isFilesystemError(err)) {
+        console.warn('FS write skipped (model fallback continues)', err);
+      }
     }
   }
 

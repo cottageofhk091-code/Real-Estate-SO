@@ -1,6 +1,13 @@
 import '@/lib/vercel-fs-guard-init';
 import { NextResponse } from 'next/server';
 import { GEMINI_ANALYZE_MODELS, generateGeminiContentWithFallback } from '@/lib/gemini';
+import { installVercelFsGuard, isFilesystemError } from '@/lib/vercel-fs-guard';
+
+// ルート読み込み時・リクエスト時の両方で確実にガード
+installVercelFsGuard();
+
+export const runtime = 'nodejs';
+export const dynamic = 'force-dynamic';
 
 type PropertyType = 'rental' | 'purchase';
 type HouseholdType = 'single' | 'family';
@@ -14,6 +21,8 @@ function labelHouseholdType(type: HouseholdType | string | undefined): string {
 }
 
 export async function POST(req: Request) {
+  installVercelFsGuard();
+
   try {
     const { text, images, propertyType, householdType } = await req.json();
 
@@ -122,27 +131,68 @@ ${text || 'なし'}
           )
         : [];
 
-    const responseText = await generateGeminiContentWithFallback(GEMINI_ANALYZE_MODELS, {
-      prompt,
-      images: imageParts,
-      generationConfig: {
-        responseMimeType: 'application/json',
-      },
-    });
+    let responseText: string;
+    try {
+      responseText = await generateGeminiContentWithFallback(GEMINI_ANALYZE_MODELS, {
+        prompt,
+        images: imageParts,
+        generationConfig: {
+          responseMimeType: 'application/json',
+        },
+      });
+    } catch (geminiError: unknown) {
+      // 依存ライブラリの FS 失敗で分析全体を落とさない
+      if (isFilesystemError(geminiError)) {
+        console.warn('FS write skipped (during Gemini analyze)', geminiError);
+        return NextResponse.json(
+          {
+            error:
+              '一時的なサーバー環境エラーが発生しました。お手数ですが、もう一度お試しください。',
+          },
+          { status: 503 }
+        );
+      }
+      throw geminiError;
+    }
 
-    const parsedData = JSON.parse(responseText);
+    let parsedData: Record<string, unknown>;
+    try {
+      parsedData = JSON.parse(responseText) as Record<string, unknown>;
+    } catch (parseError: unknown) {
+      console.warn('Analyze JSON parse failed', parseError);
+      return NextResponse.json(
+        { error: '分析結果の解析に失敗しました。もう一度お試しください。' },
+        { status: 502 }
+      );
+    }
 
     // 旧フィールド互換: marketForecastReport しか無い場合は将来予測へ寄せる
-    if (!parsedData.futureForecastReport && Array.isArray(parsedData.marketForecastReport)) {
-      parsedData.futureForecastReport = parsedData.marketForecastReport;
-    }
-    if (!parsedData.priceHistoryReport && Array.isArray(parsedData.marketForecastReport)) {
-      parsedData.priceHistoryReport = parsedData.marketForecastReport.slice(0, 2);
+    try {
+      if (!parsedData.futureForecastReport && Array.isArray(parsedData.marketForecastReport)) {
+        parsedData.futureForecastReport = parsedData.marketForecastReport;
+      }
+      if (!parsedData.priceHistoryReport && Array.isArray(parsedData.marketForecastReport)) {
+        parsedData.priceHistoryReport = (parsedData.marketForecastReport as unknown[]).slice(0, 2);
+      }
+    } catch (e) {
+      console.warn('FS write skipped / compat mapping skipped', e);
     }
 
     return NextResponse.json(parsedData);
   } catch (error: unknown) {
     console.error('API Error:', error);
+
+    if (isFilesystemError(error)) {
+      console.warn('FS write skipped (analyze top-level)', error);
+      return NextResponse.json(
+        {
+          error:
+            '一時的なサーバー環境エラーが発生しました。お手数ですが、もう一度お試しください。',
+        },
+        { status: 503 }
+      );
+    }
+
     const message = error instanceof Error ? error.message : '分析処理中にエラーが発生しました。';
     let status = 500;
     if (/quota|429|resource.?exhausted|rate.?limit/i.test(message)) status = 429;

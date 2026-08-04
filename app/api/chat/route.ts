@@ -1,8 +1,16 @@
 import '@/lib/vercel-fs-guard-init';
 import { NextResponse } from 'next/server';
 import { GEMINI_CHAT_MODELS, generateGeminiContentWithFallback } from '@/lib/gemini';
+import { installVercelFsGuard, isFilesystemError } from '@/lib/vercel-fs-guard';
+
+installVercelFsGuard();
+
+export const runtime = 'nodejs';
+export const dynamic = 'force-dynamic';
 
 export async function POST(req: Request) {
+  installVercelFsGuard();
+
   try {
     const {
       propertyInfo,
@@ -58,7 +66,7 @@ export async function POST(req: Request) {
 【回答の組み立て】
 1) 結論（最初の1文でスパッと言い切る）
 2) 必要に応じて根拠・理由（物件情報や査定結果に触れて具体的に）
-3) 必要に応じて具体的アドバイス（交渉・内見・確認・見送りなど）
+3) 必要に応じて具体アドバイス（交渉・内見・確認・見送りなど）
 
 【分量（可変・厳守）】
 - 簡単な質問（Yes/No、一言確認、簡単な交渉可否など）は100〜150文字程度で素早く返答する。
@@ -79,18 +87,42 @@ ${newMessage.trim()}
 
 質問の難易度に合わせて分量を調整し、途切れることなく最後まで回答を完成させてください。`;
 
-    const reply = await generateGeminiContentWithFallback(GEMINI_CHAT_MODELS, {
-      prompt,
-      generationConfig: {
-        // 詳細回答の途切れ防止（日本語の長文も余裕を持ってカバー）
-        maxOutputTokens: 1500,
-        temperature: 0.75,
-      },
-    });
+    let reply: string;
+    try {
+      reply = await generateGeminiContentWithFallback(GEMINI_CHAT_MODELS, {
+        prompt,
+        generationConfig: {
+          maxOutputTokens: 1500,
+          temperature: 0.75,
+        },
+      });
+    } catch (chatError: unknown) {
+      if (isFilesystemError(chatError)) {
+        console.warn('FS write skipped (during Gemini chat)', chatError);
+        return NextResponse.json(
+          {
+            error:
+              '一時的なサーバー環境エラーが発生しました。お手数ですが、もう一度お試しください。',
+          },
+          { status: 503 }
+        );
+      }
+      throw chatError;
+    }
 
     return NextResponse.json({ reply: reply.trim() });
   } catch (error: unknown) {
     console.error('Chat route error:', error);
+    if (isFilesystemError(error)) {
+      console.warn('FS write skipped (chat top-level)', error);
+      return NextResponse.json(
+        {
+          error:
+            '一時的なサーバー環境エラーが発生しました。お手数ですが、もう一度お試しください。',
+        },
+        { status: 503 }
+      );
+    }
     const message = error instanceof Error ? error.message : '内部エラーが発生しました';
     let status = 500;
     if (/quota|429|resource.?exhausted|rate.?limit/i.test(message)) status = 429;
