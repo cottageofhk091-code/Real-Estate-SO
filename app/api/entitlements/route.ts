@@ -1,28 +1,39 @@
 import { NextResponse } from 'next/server';
-import { getServerUser, toClientPurchasedRecords } from '@/lib/server-user-store';
+import {
+  getServerUser,
+  toClientPurchasedRecords,
+} from '@/lib/entitlements';
+
+/** Edge では Node fs が使えないため、mkdir('/var/task/data') 系エラーを構造的に排除 */
+export const runtime = 'edge';
+export const dynamic = 'force-dynamic';
 
 function emptyEntitlements(userId: string) {
   return {
-    found: false,
+    found: false as const,
     userId,
     plan: 'FREE' as const,
     stripeCustomerId: null,
+    email: null,
     purchasedPropertyIds: [] as string[],
-    purchasedProperties: [] as unknown[],
+    purchasedProperties: [] as ReturnType<typeof toClientPurchasedRecords>,
   };
 }
 
-/** クライアント LocalStorage とサーバー権利情報を同期するための取得API */
+/**
+ * 利用権限（Entitlements）取得 API
+ * - ファイルシステム非依存（インメモリのみ）
+ * - Vercel でも /data・./data・process.cwd() へは一切アクセスしない
+ */
 export async function GET(req: Request) {
   let userId = '';
   try {
     const { searchParams } = new URL(req.url);
-    userId = searchParams.get('userId')?.trim() || '';
+    userId = (searchParams.get('userId') || '').trim();
     if (!userId) {
       return NextResponse.json({ error: 'userId が必要です。' }, { status: 400 });
     }
 
-    // fs 不使用のインメモリストアのみ参照。失敗時はダミーを返す（Vercel で 500 にしない）
     const record = await getServerUser(userId);
     if (!record) {
       return NextResponse.json(emptyEntitlements(userId));
@@ -43,8 +54,7 @@ export async function GET(req: Request) {
       updatedAt: record.updatedAt,
     });
   } catch (error: unknown) {
-    console.error('Entitlements GET error:', error);
-    // ファイルシステム起因のエラーでも画面を止めない
+    console.error('[entitlements] GET error:', error);
     return NextResponse.json(emptyEntitlements(userId || 'unknown'));
   }
 }

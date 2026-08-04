@@ -7,7 +7,7 @@ import {
   setMonthlyPlan,
   toClientPurchasedRecords,
   upsertServerUser,
-} from '@/lib/server-user-store';
+} from '@/lib/entitlements';
 
 /**
  * Checkout 成功後のフォールバック確認。

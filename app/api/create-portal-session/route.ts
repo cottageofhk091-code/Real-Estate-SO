@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
 import { getAppBaseUrl, getStripe } from '@/lib/stripe';
-import { getServerUser } from '@/lib/server-user-store';
+import { getServerUser } from '@/lib/entitlements';
 
 type PortalBody = {
   userId?: string;

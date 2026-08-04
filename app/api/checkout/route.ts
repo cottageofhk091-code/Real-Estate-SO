@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
 import { getAppBaseUrl, getStripe } from '@/lib/stripe';
-import { getServerUser, upsertServerUser, type ServerPurchasedProperty } from '@/lib/server-user-store';
+import { getServerUser, upsertServerUser, type ServerPurchasedProperty } from '@/lib/entitlements';
 
 export type CheckoutPlanType = 'SINGLE' | 'MONTHLY';
 

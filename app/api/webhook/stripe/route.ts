@@ -8,7 +8,7 @@ import {
   setFreePlanByUserId,
   setMonthlyPlan,
   upsertServerUser,
-} from '@/lib/server-user-store';
+} from '@/lib/entitlements';
 
 export const runtime = 'nodejs';
 
