@@ -1,10 +1,21 @@
 import { NextResponse } from 'next/server';
 
 const DISCORD_FIELD_MAX = 1024;
+const APP_NAME = '物件セカンドオピニオン AI Pro';
 
 function truncate(value: string, max = DISCORD_FIELD_MAX): string {
   if (value.length <= max) return value;
   return `${value.slice(0, max - 1)}…`;
+}
+
+function buildGmailComposeUrl(to: string): string {
+  const params = new URLSearchParams({
+    view: 'cm',
+    fs: '1',
+    to,
+    su: `【お問い合わせへの返信】${APP_NAME}`,
+  });
+  return `https://mail.google.com/mail/?${params.toString()}`;
 }
 
 export async function POST(request: Request) {
@@ -27,19 +38,17 @@ export async function POST(request: Request) {
       );
     }
 
-    const submittedAt = new Date().toLocaleString('ja-JP', {
-      timeZone: 'Asia/Tokyo',
-      year: 'numeric',
-      month: '2-digit',
-      day: '2-digit',
-      hour: '2-digit',
-      minute: '2-digit',
-      second: '2-digit',
-    });
+    const trimmedEmail = String(email).trim();
+    const displayName = name?.trim() ? `${name.trim()} 様` : '（未入力）';
+    const gmailUrl = buildGmailComposeUrl(trimmedEmail);
 
     const fields = [
-      { name: 'お名前', value: truncate(name?.trim() || '（未入力）'), inline: true },
-      { name: 'メールアドレス', value: truncate(String(email).trim()), inline: true },
+      { name: 'お名前', value: truncate(displayName), inline: true },
+      {
+        name: 'メールアドレス',
+        value: truncate(`\`${trimmedEmail}\``),
+        inline: true,
+      },
     ];
 
     if (type) {
@@ -50,24 +59,23 @@ export async function POST(request: Request) {
       });
     }
 
-    fields.push(
-      {
-        name: 'お問い合わせ内容',
-        value: truncate(String(message).trim()),
-        inline: false,
-      },
-      {
-        name: '送信日時',
-        value: submittedAt,
-        inline: false,
-      }
-    );
+    fields.push({
+      name: 'お問い合わせ内容',
+      value: truncate(String(message).trim()),
+      inline: false,
+    });
 
     const payload = {
       embeds: [
         {
           title: '📩 新しいお問い合わせが届きました',
-          color: 0x38bdf8,
+          color: 3447003,
+          description: [
+            '👤 送信者メールアドレス:',
+            `\`${trimmedEmail}\` (クリックでコピー)`,
+            '',
+            `🚀 [✉️ Web版Gmailで返信画面を開く](${gmailUrl})`,
+          ].join('\n'),
           fields,
           timestamp: new Date().toISOString(),
         },

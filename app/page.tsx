@@ -1,6 +1,7 @@
 'use client';
 
 import { useState, useEffect, useRef, type CSSProperties, type FormEvent, type ChangeEvent } from 'react';
+import { track } from '@vercel/analytics';
 import {
   type AnalysisSnapshot,
   type AppUser,
@@ -854,6 +855,7 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
 
       setProgressPercent(100);
       setResult(data);
+      track('analyze_executed');
       setFreeTrialUnlockedForResult(entitledByFreeTrial);
       if (entitledByFreeTrial) {
         consumeFreeTrial();
