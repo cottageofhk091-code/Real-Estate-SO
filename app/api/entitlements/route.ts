@@ -3,6 +3,7 @@ import {
   getServerUser,
   toClientPurchasedRecords,
 } from '@/lib/entitlements';
+import { KvNotConfiguredError, isKvConfigured } from '@/lib/kv';
 
 /** Edge では Node fs が使えないため、mkdir('/var/task/data') 系エラーを構造的に排除 */
 export const runtime = 'edge';
@@ -14,6 +15,9 @@ function emptyEntitlements(userId: string) {
     userId,
     plan: 'FREE' as const,
     stripeCustomerId: null,
+    stripeSubscriptionId: null,
+    subscriptionStatus: null,
+    paymentFailedAt: null,
     email: null,
     purchasedPropertyIds: [] as string[],
     purchasedProperties: [] as ReturnType<typeof toClientPurchasedRecords>,
@@ -22,12 +26,21 @@ function emptyEntitlements(userId: string) {
 
 /**
  * 利用権限（Entitlements）取得 API
- * - ファイルシステム非依存（インメモリのみ）
- * - Vercel でも /data・./data・process.cwd() へは一切アクセスしない
+ * - KV / Upstash Redis 必須（未設定時は 503）
  */
 export async function GET(req: Request) {
   let userId = '';
   try {
+    if (!isKvConfigured()) {
+      return NextResponse.json(
+        {
+          error:
+            '権利ストア（KV / Upstash Redis）が未設定です。KV_REST_API_* または UPSTASH_REDIS_REST_* を設定してください。',
+        },
+        { status: 503 }
+      );
+    }
+
     const { searchParams } = new URL(req.url);
     userId = (searchParams.get('userId') || '').trim();
     if (!userId) {
@@ -48,6 +61,9 @@ export async function GET(req: Request) {
       userId: record.userId,
       plan: record.plan,
       stripeCustomerId: record.stripeCustomerId || null,
+      stripeSubscriptionId: record.stripeSubscriptionId || null,
+      subscriptionStatus: record.subscriptionStatus || null,
+      paymentFailedAt: record.paymentFailedAt || null,
       email: record.email || null,
       purchasedPropertyIds: record.purchasedPropertyIds,
       purchasedProperties,
@@ -55,6 +71,9 @@ export async function GET(req: Request) {
     });
   } catch (error: unknown) {
     console.error('[entitlements] GET error:', error);
+    if (error instanceof KvNotConfiguredError) {
+      return NextResponse.json({ error: error.message }, { status: 503 });
+    }
     return NextResponse.json(emptyEntitlements(userId || 'unknown'));
   }
 }

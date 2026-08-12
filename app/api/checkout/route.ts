@@ -1,5 +1,15 @@
-import { NextResponse } from 'next/server';
-import { getAppBaseUrl, getStripe } from '@/lib/stripe';
+﻿import { NextResponse } from 'next/server';
+import {
+  PRICE_MONTHLY_FIRST_YEN,
+  PRICE_MONTHLY_YEN,
+  buildSinglePriceDataLineItem,
+  getAppBaseUrl,
+  getStripe,
+  isStripeSecretConfigured,
+  resolveFirstMonthCouponId,
+  resolveSingleCheckoutLineItem,
+} from '@/lib/stripe';
+import { KvNotConfiguredError, isKvConfigured } from '@/lib/kv';
 import { getServerUser, upsertServerUser, type ServerPurchasedProperty } from '@/lib/entitlements';
 
 export type CheckoutPlanType = 'SINGLE' | 'MONTHLY';
@@ -12,12 +22,35 @@ type CheckoutBody = {
   propertySnapshot?: ServerPurchasedProperty | null;
 };
 
+const STRIPE_NOT_READY_MESSAGE =
+  '決済機能の準備中です。しばらくしてから再度お試しください。';
+
+const KV_NOT_READY_MESSAGE =
+  '決済機能の準備中です（権利ストア未設定）。しばらくしてから再度お試しください。';
+
+function isMissingStripePriceError(error: unknown): boolean {
+  if (!error || typeof error !== 'object') return false;
+  const err = error as { code?: string; message?: string; raw?: { code?: string } };
+  const code = err.code || err.raw?.code;
+  if (code === 'resource_missing') return true;
+  const message = typeof err.message === 'string' ? err.message.toLowerCase() : '';
+  return message.includes('no such price');
+}
+
 export async function POST(req: Request) {
   try {
+    if (!isStripeSecretConfigured()) {
+      return NextResponse.json({ error: STRIPE_NOT_READY_MESSAGE }, { status: 503 });
+    }
+    if (!isKvConfigured()) {
+      console.error('[checkout] KV/Upstash Redis is not configured (fail-closed)');
+      return NextResponse.json({ error: KV_NOT_READY_MESSAGE }, { status: 503 });
+    }
+
     const body = (await req.json()) as CheckoutBody;
     const planType = body.planType;
     const userId = typeof body.userId === 'string' ? body.userId.trim() : '';
-    const propertyId = typeof body.propertyId === 'string' ? body.propertyId.trim() : '';
+    let propertyId = typeof body.propertyId === 'string' ? body.propertyId.trim() : '';
     const email = typeof body.email === 'string' ? body.email.trim() : '';
 
     if (!userId) {
@@ -27,18 +60,14 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: 'planType は SINGLE または MONTHLY です。' }, { status: 400 });
     }
     if (planType === 'SINGLE' && (!propertyId || propertyId === 'prop_empty')) {
-      return NextResponse.json(
-        { error: '単発プランでは有効な propertyId が必要です。' },
-        { status: 400 }
-      );
+      // 物件テキスト未入力でも購入可能。サーバー側で仮 ID を発行する。
+      propertyId = `prop_pending_${userId.slice(-8)}_${Date.now().toString(36)}`;
     }
 
-    // 決済前にサーバー側ユーザーを確保（Webhookで参照）
     await upsertServerUser(userId, {
       email: email || null,
     });
 
-    // 単発購入の物件スナップショットを pending として一時保存
     if (planType === 'SINGLE' && body.propertySnapshot) {
       const current = await getServerUser(userId);
       const pending = {
@@ -62,22 +91,11 @@ export async function POST(req: Request) {
     const cancelUrl = `${baseUrl}/?checkout=cancel`;
 
     if (planType === 'SINGLE') {
-      const session = await stripe.checkout.sessions.create({
-        mode: 'payment',
-        payment_method_types: ['card'],
-        line_items: [
-          {
-            quantity: 1,
-            price_data: {
-              currency: 'jpy',
-              unit_amount: 500,
-              product_data: {
-                name: '物件セカンドオピニオン AI Pro（単発）',
-                description: `1物件PRO診断買い切り（propertyId: ${propertyId}）`,
-              },
-            },
-          },
-        ],
+      const lineItem = await resolveSingleCheckoutLineItem(stripe, propertyId);
+      const sessionParams = {
+        mode: 'payment' as const,
+        payment_method_types: ['card' as const],
+        line_items: [lineItem],
         success_url: successUrl,
         cancel_url: cancelUrl,
         client_reference_id: userId,
@@ -94,7 +112,25 @@ export async function POST(req: Request) {
             planType: 'SINGLE',
           },
         },
-      });
+      };
+
+      let session;
+      try {
+        session = await stripe.checkout.sessions.create(sessionParams);
+      } catch (error: unknown) {
+        // Price ID が途中で無効化された場合など、price_data で再試行
+        if ('price' in lineItem && isMissingStripePriceError(error)) {
+          console.warn(
+            '[checkout] single price id failed at session.create; retrying with price_data'
+          );
+          session = await stripe.checkout.sessions.create({
+            ...sessionParams,
+            line_items: [buildSinglePriceDataLineItem(propertyId)],
+          });
+        } else {
+          throw error;
+        }
+      }
 
       if (!session.url) {
         return NextResponse.json({ error: 'Checkout URL の生成に失敗しました。' }, { status: 500 });
@@ -102,6 +138,9 @@ export async function POST(req: Request) {
 
       return NextResponse.json({ url: session.url, sessionId: session.id });
     }
+
+    // 月額は常に lib/pricing の PRICE_MONTHLY_YEN で price_data を生成（固定 Price ID / クライアント金額は参照しない）
+    const firstMonthCouponId = await resolveFirstMonthCouponId(stripe);
 
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription',
@@ -111,15 +150,16 @@ export async function POST(req: Request) {
           quantity: 1,
           price_data: {
             currency: 'jpy',
-            unit_amount: 1980,
+            unit_amount: PRICE_MONTHLY_YEN,
             recurring: { interval: 'month' },
             product_data: {
-              name: '物件セカンドオピニオン AI Pro（月額）',
-              description: '月額1,980円（税込）/ 全物件PRO機能解放',
+              name: '不動産セカンドオピニオンAI（月額）',
+              description: `月額${PRICE_MONTHLY_YEN.toLocaleString('ja-JP')}円（税込）/ 初月${PRICE_MONTHLY_FIRST_YEN}円 / 全物件PRO機能解放`,
             },
           },
         },
       ],
+      discounts: [{ coupon: firstMonthCouponId }],
       success_url: successUrl,
       cancel_url: cancelUrl,
       client_reference_id: userId,
@@ -127,6 +167,8 @@ export async function POST(req: Request) {
       metadata: {
         userId,
         planType: 'MONTHLY',
+        firstMonthCouponId,
+        unitAmountYen: String(PRICE_MONTHLY_YEN),
       },
       subscription_data: {
         metadata: {
@@ -143,7 +185,14 @@ export async function POST(req: Request) {
     return NextResponse.json({ url: session.url, sessionId: session.id });
   } catch (error: unknown) {
     console.error('Checkout API error:', error);
-    const message = error instanceof Error ? error.message : 'Checkout Session の作成に失敗しました。';
+    if (error instanceof KvNotConfiguredError) {
+      return NextResponse.json({ error: KV_NOT_READY_MESSAGE }, { status: 503 });
+    }
+    const raw = error instanceof Error ? error.message : '';
+    if (raw.includes('STRIPE_SECRET_KEY')) {
+      return NextResponse.json({ error: STRIPE_NOT_READY_MESSAGE }, { status: 503 });
+    }
+    const message = raw || 'Checkout Session の作成に失敗しました。';
     return NextResponse.json({ error: message }, { status: 500 });
   }
 }

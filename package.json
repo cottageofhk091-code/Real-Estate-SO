@@ -13,6 +13,7 @@
     "@google/generative-ai": "^0.24.1",
     "@sentry/nextjs": "^10.69.0",
     "@stripe/stripe-js": "^9.12.1",
+    "@upstash/redis": "^1.38.2",
     "@vercel/analytics": "^2.0.1",
     "next": "16.2.12",
     "react": "19.2.4",

@@ -2,6 +2,7 @@
 
 import Link from 'next/link';
 import { useEffect, useState } from 'react';
+import { SubscriptionManageButton } from '@/components/SubscriptionManageButton';
 import {
   type AppUser,
   VIEW_PURCHASED_QUERY,
@@ -44,7 +45,6 @@ function formatDate(iso: string) {
 export default function MyPage() {
   const [user, setUser] = useState<AppUser | null>(null);
   const [message, setMessage] = useState<string | null>(null);
-  const [portalLoading, setPortalLoading] = useState(false);
 
   useEffect(() => {
     let next = readUserState();
@@ -71,31 +71,6 @@ export default function MyPage() {
   const persist = (next: AppUser) => {
     writeUserState(next);
     setUser(next);
-  };
-
-  const handleCancelMonthly = async () => {
-    if (!user) return;
-    setPortalLoading(true);
-    setMessage(null);
-    try {
-      const res = await fetch('/api/create-portal-session', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          userId: user.userId,
-          stripeCustomerId: user.stripeCustomerId,
-        }),
-      });
-      const data = await res.json();
-      if (!res.ok || !data.url) {
-        throw new Error(data.error || 'Stripe契約管理ページを開けませんでした。');
-      }
-      window.location.href = data.url as string;
-    } catch (err: unknown) {
-      const text = err instanceof Error ? err.message : '解約ページの表示に失敗しました。';
-      setMessage(text);
-      setPortalLoading(false);
-    }
   };
 
   const handleStartMonthly = () => {
@@ -387,42 +362,37 @@ export default function MyPage() {
             </div>
           </div>
 
-          <div style={{ marginTop: '18px', display: 'flex', flexWrap: 'wrap', gap: '10px' }}>
+          <div style={{ marginTop: '18px' }}>
             {user.plan === 'MONTHLY' ? (
-              <button
-                type="button"
-                onClick={() => void handleCancelMonthly()}
-                disabled={portalLoading}
+              <div
                 style={{
-                  background: '#fff',
-                  color: '#b91c1c',
-                  border: '1px solid #fecaca',
-                  borderRadius: '10px',
-                  padding: '10px 16px',
-                  fontWeight: 800,
-                  cursor: portalLoading ? 'not-allowed' : 'pointer',
-                  fontSize: '13px',
+                  border: '1px solid #e2e8f0',
+                  borderRadius: '12px',
+                  padding: '14px',
+                  background: '#f8fafc',
                 }}
               >
-                {portalLoading ? 'Stripeへ移動中...' : 'Stripeで解約・契約管理'}
-              </button>
+                <div style={{ fontSize: '13px', fontWeight: 800, color: '#0f172a', marginBottom: '6px' }}>
+                  月額PROプランの管理・解約
+                </div>
+                <p style={{ margin: '0 0 12px 0', fontSize: '12px', color: '#64748b', lineHeight: 1.6 }}>
+                  解約・カード情報の変更・請求履歴の確認は、アンケート回答後の Stripe カスタマーポータルから行えます。
+                </p>
+                <SubscriptionManageButton
+                  mode="manage"
+                  userId={user.userId}
+                  stripeCustomerId={user.stripeCustomerId}
+                  email={user.email}
+                />
+              </div>
             ) : (
-              <button
-                type="button"
-                onClick={handleStartMonthly}
-                style={{
-                  background: 'linear-gradient(to right, #4f46e5, #2563eb)',
-                  color: '#fff',
-                  border: 'none',
-                  borderRadius: '10px',
-                  padding: '10px 16px',
-                  fontWeight: 800,
-                  cursor: 'pointer',
-                  fontSize: '13px',
-                }}
-              >
-                月額PROプランに登録する
-              </button>
+              <SubscriptionManageButton
+                mode="join"
+                userId={user.userId}
+                stripeCustomerId={user.stripeCustomerId}
+                email={user.email}
+                onJoin={handleStartMonthly}
+              />
             )}
           </div>
         </section>

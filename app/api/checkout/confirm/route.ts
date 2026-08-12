@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import type Stripe from 'stripe';
-import { getStripe } from '@/lib/stripe';
+import { getStripe, isStripeSecretConfigured } from '@/lib/stripe';
+import { KvNotConfiguredError, isKvConfigured } from '@/lib/kv';
 import {
   addPurchasedPropertyToServerUser,
   getServerUser,
@@ -15,6 +16,22 @@ import {
  */
 export async function POST(req: Request) {
   try {
+    if (!isStripeSecretConfigured()) {
+      return NextResponse.json(
+        { error: '決済機能の準備中です。しばらくしてから再度お試しください。' },
+        { status: 503 }
+      );
+    }
+    if (!isKvConfigured()) {
+      return NextResponse.json(
+        {
+          error:
+            '権利ストア（KV / Upstash Redis）が未設定です。KV_REST_API_* または UPSTASH_REDIS_REST_* を設定してください。',
+        },
+        { status: 503 }
+      );
+    }
+
     const body = (await req.json()) as { sessionId?: string; userId?: string };
     const sessionId = typeof body.sessionId === 'string' ? body.sessionId.trim() : '';
     const requestUserId = typeof body.userId === 'string' ? body.userId.trim() : '';
@@ -28,7 +45,11 @@ export async function POST(req: Request) {
 
     if (session.payment_status !== 'paid' && session.status !== 'complete') {
       return NextResponse.json(
-        { error: '決済が完了していません。', status: session.status, payment_status: session.payment_status },
+        {
+          error: '決済が完了していません。',
+          status: session.status,
+          payment_status: session.payment_status,
+        },
         { status: 402 }
       );
     }
@@ -79,7 +100,16 @@ export async function POST(req: Request) {
         }
       }
     } else if (planType === 'MONTHLY') {
-      await setMonthlyPlan(userId, customerId, email);
+      const subscriptionId =
+        typeof session.subscription === 'string'
+          ? session.subscription
+          : session.subscription && typeof session.subscription === 'object'
+            ? session.subscription.id
+            : null;
+      await setMonthlyPlan(userId, customerId, email, {
+        stripeSubscriptionId: subscriptionId,
+        subscriptionStatus: 'active',
+      });
     }
 
     const record = await getServerUser(userId);
@@ -97,6 +127,9 @@ export async function POST(req: Request) {
     });
   } catch (error: unknown) {
     console.error('Checkout confirm error:', error);
+    if (error instanceof KvNotConfiguredError) {
+      return NextResponse.json({ error: error.message }, { status: 503 });
+    }
     const message = error instanceof Error ? error.message : '決済確認に失敗しました。';
     return NextResponse.json({ error: message }, { status: 500 });
   }

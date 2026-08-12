@@ -4,8 +4,11 @@
  */
 export {
   addPurchasedPropertyToServerUser,
+  applySubscriptionStatus,
   findServerUserByCustomerId,
   getServerUser,
+  isKvConfigured,
+  markPaymentFailedByCustomerId,
   setFreePlanByCustomerId,
   setFreePlanByUserId,
   setMonthlyPlan,

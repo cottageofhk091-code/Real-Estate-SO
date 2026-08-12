@@ -1,6 +1,7 @@
 "use client";
 
 import { FormEvent, useEffect, useId, useState } from "react";
+import { PRICE_MONTHLY_YEN } from "@/lib/pricing";
 
 const FEATURED_BENEFIT = {
   icon: "💬",
@@ -161,7 +162,7 @@ export default function PremiumModal({ open, onClose }: PremiumModalProps) {
               >
                 <p className="text-xs font-medium text-slate-300">月額プラン</p>
                 <p className="mt-1 text-xl font-bold">
-                  ¥980
+                  ¥{PRICE_MONTHLY_YEN.toLocaleString("ja-JP")}
                   <span className="ml-1 text-xs font-medium text-slate-400">
                     /月
                   </span>
@@ -211,7 +212,7 @@ export default function PremiumModal({ open, onClose }: PremiumModalProps) {
                 先行体験に応募する / 近日公開通知を受け取る
               </button>
               <p className="text-center text-[11px] leading-relaxed text-slate-400">
-                選択中: {plan === "yearly" ? "年額 9,800円" : "月額 980円"}
+                選択中: {plan === "yearly" ? "年額 9,800円" : `月額 ${PRICE_MONTHLY_YEN.toLocaleString("ja-JP")}円`}
                 （税込・予定価格）。登録はいつでも解除できます。
               </p>
             </form>

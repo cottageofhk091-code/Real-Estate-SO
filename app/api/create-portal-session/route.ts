@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
-import { getAppBaseUrl, getStripe } from '@/lib/stripe';
+import { getAppBaseUrl, getStripe, isStripeSecretConfigured } from '@/lib/stripe';
 import { getServerUser } from '@/lib/entitlements';
+import { KvNotConfiguredError, isKvConfigured } from '@/lib/kv';
 
 type PortalBody = {
   userId?: string;
@@ -9,6 +10,22 @@ type PortalBody = {
 
 export async function POST(req: Request) {
   try {
+    if (!isStripeSecretConfigured()) {
+      return NextResponse.json(
+        { error: '決済機能の準備中です。しばらくしてから再度お試しください。' },
+        { status: 503 }
+      );
+    }
+    if (!isKvConfigured()) {
+      return NextResponse.json(
+        {
+          error:
+            '権利ストア（KV / Upstash Redis）が未設定です。KV_REST_API_* または UPSTASH_REDIS_REST_* を設定してください。',
+        },
+        { status: 503 }
+      );
+    }
+
     const body = (await req.json()) as PortalBody;
     const userId = typeof body.userId === 'string' ? body.userId.trim() : '';
     let customerId =
@@ -43,6 +60,9 @@ export async function POST(req: Request) {
     return NextResponse.json({ url: session.url });
   } catch (error: unknown) {
     console.error('Portal session error:', error);
+    if (error instanceof KvNotConfiguredError) {
+      return NextResponse.json({ error: error.message }, { status: 503 });
+    }
     const message = error instanceof Error ? error.message : 'Portal Session の作成に失敗しました。';
     return NextResponse.json({ error: message }, { status: 500 });
   }

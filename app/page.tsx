@@ -2,6 +2,13 @@
 
 import { useState, useEffect, useRef, type CSSProperties, type FormEvent, type ChangeEvent } from 'react';
 import { track } from '@vercel/analytics';
+import { SubscriptionManageButton } from '@/components/SubscriptionManageButton';
+import {
+  PRICE_MONTHLY_FIRST_YEN,
+  PRICE_MONTHLY_YEN,
+  PRICE_SINGLE_YEN,
+  formatYen,
+} from '@/lib/pricing';
 import {
   type AnalysisSnapshot,
   type AppUser,
@@ -628,34 +635,6 @@ export default function Home() {
     setError(null);
   };
 
-  const openStripeCustomerPortal = async () => {
-    setPaywallSubmitting(true);
-    setPaywallMessage(null);
-    try {
-      const res = await fetch('/api/create-portal-session', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          userId: user.userId,
-          stripeCustomerId: user.stripeCustomerId,
-        }),
-      });
-      const data = await res.json();
-      if (!res.ok || !data.url) {
-        throw new Error(data.error || '契約管理ページを開けませんでした。');
-      }
-      window.location.href = data.url as string;
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : '契約管理ページの表示に失敗しました。';
-      setPaywallMessage(message);
-      setPaywallSubmitting(false);
-    }
-  };
-
-  const cancelSubscriptionToFree = () => {
-    void openStripeCustomerPortal();
-  };
-
   /** DEV: 月額 / 無料へ切替（FREE時は購入履歴もクリアして初期化） */
   const applyDevPlan = (plan: UserPlan) => {
     if (!IS_DEV) return;
@@ -1088,21 +1067,16 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
     setPaywallSubmitting(true);
     setPaywallMessage(null);
 
+    // 物件テキスト未入力でも単発購入可能。空の場合は一意の仮 ID を発行する。
     const propertyId =
-      currentPropertyId || (inputText.trim() ? buildPropertyId(inputText) : null);
-    if (propertyId) {
-      setCurrentPropertyId(propertyId);
-    }
+      currentPropertyId && currentPropertyId !== 'prop_empty'
+        ? currentPropertyId
+        : inputText.trim()
+          ? buildPropertyId(inputText)
+          : `prop_pending_${user.userId.slice(-8)}_${Date.now().toString(36)}`;
+    setCurrentPropertyId(propertyId);
 
     const planType = selectedPlan === 'ticket' ? 'SINGLE' : 'MONTHLY';
-
-    if (planType === 'SINGLE' && (!propertyId || propertyId === 'prop_empty')) {
-      setPaywallMessage(
-        '単発プランでは物件テキストの入力（または解析）が必要です。物件情報を入力してから再度お試しください。'
-      );
-      setPaywallSubmitting(false);
-      return;
-    }
 
     const email = paywallEmail.trim() || user.email || '';
     if (!email || !email.includes('@')) {
@@ -1142,7 +1116,7 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
           propertyId: planType === 'SINGLE' ? propertyId : undefined,
           email,
           propertySnapshot:
-            planType === 'SINGLE' && propertyId
+            planType === 'SINGLE'
               ? {
                   propertyId,
                   title: extractPropertyTitle(inputText || propertyId),
@@ -1634,7 +1608,7 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
                 cursor: stripeTestLoading ? 'not-allowed' : 'pointer',
               }}
             >
-              {stripeTestLoading === 'MONTHLY' ? 'リダイレクト中...' : '🔁 月額1,980円 Checkout を開く'}
+              {stripeTestLoading === 'MONTHLY' ? 'リダイレクト中...' : `🔁 月額${formatYen(PRICE_MONTHLY_YEN)}（初月${formatYen(PRICE_MONTHLY_FIRST_YEN)}）Checkout を開く`}
             </button>
             <span style={{ fontSize: '11px', color: COLORS.textDim }}>
               → checkout.stripe.com へ遷移（テストカード: 4242…）
@@ -2454,7 +2428,7 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
                     },
                     {
                       t: '■ 販売価格',
-                      b: '・単発プラン：500円（税込）\n・PRO月額プラン：初月500円（税込）、2ヶ月目以降 1,980円/月（税込）',
+                      b: `・単発プラン：${formatYen(PRICE_SINGLE_YEN)}（税込）\n・PRO月額プラン：初月${formatYen(PRICE_MONTHLY_FIRST_YEN)}（税込）、2ヶ月目以降 ${formatYen(PRICE_MONTHLY_YEN)}/月（税込）`,
                     },
                     {
                       t: '■ 商品代金以外の必要料金',
@@ -2592,7 +2566,7 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
                   >
                     {authIntent === 'paywall' && (
                       <>
-                        選択中プラン: {pendingPayPlan === 'ticket' || selectedPlan === 'ticket' ? '単発500円' : 'PRO月額（初月500円）'}
+                        選択中プラン: {pendingPayPlan === 'ticket' || selectedPlan === 'ticket' ? `単発${formatYen(PRICE_SINGLE_YEN)}` : `PRO月額（初月${formatYen(PRICE_MONTHLY_FIRST_YEN)}）`}
                         <br />
                       </>
                     )}
@@ -2615,7 +2589,7 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
                       color: COLORS.text,
                     }}
                   >
-                    {authSubmitting ? '処理中...' : '🔵 Googleで続ける（デモ）'}
+                    {authSubmitting ? '処理中...' : '🔵 Googleで続ける'}
                   </button>
 
                   <div style={{ display: 'flex', alignItems: 'center', gap: '10px', color: COLORS.textDim, fontSize: '12px' }}>
@@ -2652,12 +2626,12 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
                       {authSubmitting
                         ? '認証中...'
                         : authIntent === 'paywall'
-                          ? 'メールで登録して決済へ進む（デモ）'
-                          : 'メールでログイン / 新規登録（デモ）'}
+                          ? 'メールで登録して決済へ進む'
+                          : 'メールでログイン / 新規登録'}
                     </button>
                   </form>
                   <p style={{ margin: 0, fontSize: '11px', color: COLORS.textDim, textAlign: 'center' }}>
-                    デモ環境です。実Google OAuth / メール送信は行いません。
+                    ログイン後に決済・契約管理をご利用いただけます。
                   </p>
                 </div>
               )}
@@ -2673,7 +2647,7 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
                       <p style={{ color: COLORS.textMuted, fontSize: '14px', margin: 0, whiteSpace: 'pre-line' }}>{paywallMessage}</p>
                       {isProUser && (
                         <p style={{ margin: '12px 0 0 0', fontSize: '12px', color: COLORS.textDim }}>
-                          マイページ相当：いつでも1クリックで解約できます（デモ表示）
+                          解約・契約管理はマイページまたは下のボタンから行えます。
                         </p>
                       )}
                       <button
@@ -2694,16 +2668,16 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
                       </p>
                       {isProUser && (
                         <div style={{ padding: '12px 14px', borderRadius: '10px', backgroundColor: '#f0fdf4', border: '1px solid #bbf7d0', color: '#166534', fontSize: '13px', lineHeight: 1.6 }}>
-                          現在は月額PRO会員です。解約・お支払い方法の変更はStripeの契約管理ページから行えます。
-                          <div style={{ marginTop: '8px' }}>
-                            <button
-                              type="button"
-                              onClick={() => cancelSubscriptionToFree()}
-                              disabled={paywallSubmitting}
-                              style={{ fontSize: '12px', fontWeight: 700, color: '#b91c1c', background: '#fff', border: '1px solid #fecaca', borderRadius: '8px', padding: '6px 10px', cursor: paywallSubmitting ? 'not-allowed' : 'pointer' }}
-                            >
-                              Stripeで解約・契約管理を開く
-                            </button>
+                          現在は月額PRO会員です。解約・お支払い方法の変更は、アンケート回答後の Stripe 契約管理ページから行えます。
+                          <div style={{ marginTop: '10px' }}>
+                            <SubscriptionManageButton
+                              mode="manage"
+                              variant="compact"
+                              userId={user.userId}
+                              stripeCustomerId={user.stripeCustomerId}
+                              email={user.email}
+                              note={null}
+                            />
                           </div>
                         </div>
                       )}
@@ -2715,27 +2689,30 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
                         <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap' }}>
                           <button type="button" onClick={() => setSelectedPlan('ticket')} style={planCardStyle(selectedPlan === 'ticket')}>
                             <div style={{ fontSize: '12px', color: COLORS.textDim, marginBottom: '4px' }}>【単発プラン】</div>
-                            <div style={{ fontWeight: 800, fontSize: '15px' }}>500円 / 1物件診断</div>
+                            <div style={{ fontWeight: 800, fontSize: '15px' }}>{formatYen(PRICE_SINGLE_YEN)} / 1物件診断</div>
                             <div style={{ marginTop: '6px', fontSize: '12px', color: COLORS.textMuted, lineHeight: 1.5 }}>
                               買い切り・自動更新なし（この物件のPRO機能を解放）
                             </div>
                           </button>
                           <button type="button" onClick={() => setSelectedPlan('pro')} style={planCardStyle(selectedPlan === 'pro')}>
                             <div style={{ fontSize: '12px', color: COLORS.textDim, marginBottom: '4px' }}>【PRO月額プラン】</div>
-                            <div style={{ fontWeight: 800, fontSize: '15px', color: COLORS.accentStrong }}>1,980円 / 月</div>
+                            <div style={{ fontWeight: 800, fontSize: '15px', color: COLORS.accentStrong }}>{formatYen(PRICE_MONTHLY_YEN)} / 月</div>
                             <div style={{ marginTop: '6px', fontSize: '12px', color: COLORS.textMuted, lineHeight: 1.5 }}>
-                              全物件のPRO機能を解放・いつでも解約可能
+                              初月{formatYen(PRICE_MONTHLY_FIRST_YEN)}・全物件のPRO機能を解放・いつでも解約可能
                             </div>
                           </button>
                         </div>
                         {selectedPlan === 'pro' && (
                           <p style={{ margin: '10px 0 0 0', fontSize: '12px', color: COLORS.accentStrong, fontWeight: 700 }}>
-                            ご請求：1,980円/月（クレジットカード / Stripe Checkout）
+                            ご請求：初月{formatYen(PRICE_MONTHLY_FIRST_YEN)} → 翌月以降{formatYen(PRICE_MONTHLY_YEN)}/月（クレジットカード / Stripe Checkout）
                           </p>
                         )}
                         {selectedPlan === 'ticket' && (
                           <p style={{ margin: '10px 0 0 0', fontSize: '12px', color: COLORS.textMuted }}>
-                            現在の物件キー: {currentPropertyId || (inputText.trim() ? buildPropertyId(inputText) : '（解析後に確定）')}
+                            物件テキスト未入力でも購入できます
+                            {currentPropertyId || inputText.trim()
+                              ? `（物件キー: ${currentPropertyId || buildPropertyId(inputText)}）`
+                              : '（購入時に仮キーを発行）'}
                           </p>
                         )}
                       </div>
@@ -2793,7 +2770,7 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
 
                       <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', fontSize: '11px', color: COLORS.textDim, lineHeight: 1.65 }}>
                         <p style={{ margin: 0 }}>
-                          🔒 いつでもマイページから1クリックで解約可能（自動更新の3日前にリマインドメールをお届けします）
+                          🔒 いつでもマイページから解約・契約管理が可能です（解約前アンケートのあと Stripe カスタマーポータルへ進みます）
                         </p>
                         <p style={{ margin: 0 }}>
                           🛡️ クレジットカード情報はStripe（世界標準の決済システム）により安全に保護されます
@@ -2809,7 +2786,7 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
                           </button>
                         </p>
                         <p style={{ margin: '4px 0 0 0', textAlign: 'center' }}>
-                          デモ環境です。実カード情報は送信されず、課金も発生しません。
+                          決済は Stripe Checkout 上で完了します。カード情報は当サービスでは保持しません。
                         </p>
                       </div>
                     </form>
