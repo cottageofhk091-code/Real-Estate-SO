@@ -1,7 +1,8 @@
 import { NextResponse } from 'next/server';
 
 const DISCORD_FIELD_MAX = 1024;
-const APP_NAME = '物件セカンドオピニオン AI Pro';
+const APP_NAME = '不動産セカンドオピニオンAI';
+const WEBHOOK_USERNAME = '不動産セカンドオピニオンAI サポート';
 
 function truncate(value: string, max = DISCORD_FIELD_MAX): string {
   if (value.length <= max) return value;
@@ -66,9 +67,10 @@ export async function POST(request: Request) {
     });
 
     const payload = {
+      username: WEBHOOK_USERNAME,
       embeds: [
         {
-          title: '📩 新しいお問い合わせが届きました',
+          title: `📩 ${APP_NAME}｜新しいお問い合わせが届きました`,
           color: 3447003,
           description: [
             '👤 送信者メールアドレス:',
