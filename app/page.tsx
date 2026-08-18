@@ -10,16 +10,27 @@ import {
   formatYen,
 } from '@/lib/pricing';
 import {
+  ANALYSIS_HISTORY_LIMIT_SINGLE,
+  historyLimitForPlan,
+  upsertAnalysisHistoryRecord,
+  type AnalysisHistoryRecord,
+} from '@/lib/analysis-history';
+import {
   type AnalysisSnapshot,
   type AppUser,
   type UserPlan,
+  CHECKOUT_CONTEXT_KEY,
+  VIEW_HISTORY_QUERY,
   VIEW_PURCHASED_QUERY,
   addPurchasedPropertyRecord,
   buildPropertyId,
   canAccessProFeatures,
+  clearClientSessionCaches,
   ensureDevDummyPurchases,
   extractLocationOrUrl,
   extractPropertyTitle,
+  loginAsAccountUser,
+  logoutToGuestUser,
   mergeServerEntitlements,
   readUserState,
   writeUserState,
@@ -340,6 +351,7 @@ export default function Home() {
     authProvider: null,
     plan: 'FREE',
     purchasedProperties: [],
+    analysisHistory: [],
     stripeCustomerId: null,
   });
   const [currentPropertyId, setCurrentPropertyId] = useState<string | null>(null);
@@ -405,7 +417,7 @@ export default function Home() {
             next = mergeServerEntitlements(next, confirmData);
             // sessionStorage の診断コンテキストを購入レコードへ反映
             try {
-              const rawCtx = sessionStorage.getItem('bukken_ai_checkout_context');
+              const rawCtx = sessionStorage.getItem(CHECKOUT_CONTEXT_KEY);
               if (rawCtx) {
                 const ctx = JSON.parse(rawCtx) as {
                   propertyId?: string;
@@ -415,19 +427,46 @@ export default function Home() {
                   cachedResult?: AnalysisResult | null;
                 };
                 if (ctx.propertyId) {
+                  const purchaseRecord = {
+                    propertyId: ctx.propertyId,
+                    title: extractPropertyTitle(ctx.inputText || ctx.propertyId),
+                    locationOrUrl: extractLocationOrUrl(ctx.inputText || ctx.propertyId),
+                    purchasedAt: new Date().toISOString(),
+                    householdType: (ctx.householdType === 'family' ? 'family' : 'single') as HouseholdType,
+                    propertyType: (ctx.propertyType === 'purchase' ? 'purchase' : 'rental') as PropertyType,
+                    sourceText: ctx.inputText,
+                    cachedResult: (ctx.cachedResult as AnalysisSnapshot | null) || null,
+                  };
+                  const isSingleCheckout = confirmData.planType === 'SINGLE';
                   next = {
                     ...next,
-                    purchasedProperties: addPurchasedPropertyRecord(next.purchasedProperties, {
-                      propertyId: ctx.propertyId,
-                      title: extractPropertyTitle(ctx.inputText || ctx.propertyId),
-                      locationOrUrl: extractLocationOrUrl(ctx.inputText || ctx.propertyId),
-                      purchasedAt: new Date().toISOString(),
-                      householdType: ctx.householdType === 'family' ? 'family' : 'single',
-                      propertyType: ctx.propertyType === 'purchase' ? 'purchase' : 'rental',
-                      sourceText: ctx.inputText,
-                      cachedResult: (ctx.cachedResult as AnalysisSnapshot | null) || null,
-                    }),
+                    purchasedProperties: addPurchasedPropertyRecord(
+                      next.purchasedProperties,
+                      purchaseRecord,
+                      { singleOnly: isSingleCheckout || next.plan !== 'MONTHLY' }
+                    ),
                   };
+                  if (ctx.cachedResult && isSingleCheckout) {
+                    const historyRecord: AnalysisHistoryRecord = {
+                      propertyId: ctx.propertyId,
+                      title: purchaseRecord.title,
+                      locationOrUrl: purchaseRecord.locationOrUrl,
+                      analyzedAt: new Date().toISOString(),
+                      householdType: purchaseRecord.householdType,
+                      propertyType: purchaseRecord.propertyType,
+                      sourceText: ctx.inputText,
+                      cachedResult: ctx.cachedResult as AnalysisSnapshot,
+                      sourcePlan: 'SINGLE',
+                    };
+                    next = {
+                      ...next,
+                      analysisHistory: upsertAnalysisHistoryRecord(
+                        next.analysisHistory || [],
+                        historyRecord,
+                        ANALYSIS_HISTORY_LIMIT_SINGLE
+                      ),
+                    };
+                  }
                   setCurrentPropertyId(ctx.propertyId);
                   if (ctx.inputText) setInputText(ctx.inputText);
                   if (ctx.householdType) setHouseholdType(ctx.householdType);
@@ -436,17 +475,38 @@ export default function Home() {
                     setResult(ctx.cachedResult);
                   }
                 }
-                sessionStorage.removeItem('bukken_ai_checkout_context');
+                sessionStorage.removeItem(CHECKOUT_CONTEXT_KEY);
               }
             } catch {
               // ignore
             }
             writeUserState(next);
             setUser(next);
+            if (
+              confirmData.planType === 'SINGLE' &&
+              next.analysisHistory &&
+              next.analysisHistory.length > 0
+            ) {
+              const latest = next.analysisHistory[next.analysisHistory.length - 1];
+              void fetch('/api/analysis-history', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  userId: next.userId,
+                  propertyId: latest.propertyId,
+                  sourceText: latest.sourceText,
+                  householdType: latest.householdType,
+                  propertyType: latest.propertyType,
+                  cachedResult: latest.cachedResult,
+                  clientPlan: 'FREE',
+                  hasSinglePurchase: true,
+                }),
+              }).catch(() => undefined);
+            }
             setPaywallMessage(
               confirmData.planType === 'SINGLE'
-                ? '単発プランの決済が完了しました。この物件のPRO機能が解放されました。'
-                : '月額PROプランの登録が完了しました。全物件でPRO機能をご利用いただけます。'
+                ? '単発プランの決済が完了しました。この物件のPRO機能が解放され、分析履歴に保存されました。'
+                : '月額PROプランの登録が完了しました。全物件でPRO機能をご利用いただけます。分析結果は最新5件までマイページに保存されます。'
             );
             setActiveModal('paywall');
           } else {
@@ -463,10 +523,13 @@ export default function Home() {
           window.history.replaceState({}, '', '/');
         }
 
-        const entRes = await fetch(`/api/entitlements?userId=${encodeURIComponent(next.userId)}`);
+        const entRes = await fetch(
+          `/api/entitlements?userId=${encodeURIComponent(next.userId)}`,
+          { cache: 'no-store', headers: { 'Cache-Control': 'no-cache' } }
+        );
         if (entRes.ok) {
           const ent = await entRes.json();
-          if (ent.found) {
+          if (ent.found && ent.userId === next.userId) {
             const merged = mergeServerEntitlements(next, ent);
             writeUserState(merged);
             setUser(merged);
@@ -481,19 +544,26 @@ export default function Home() {
     try {
       const params = new URLSearchParams(window.location.search);
       const purchasedId = params.get(VIEW_PURCHASED_QUERY);
+      const historyId = params.get(VIEW_HISTORY_QUERY);
       const openPaywallFlag = params.get('openPaywall');
       const openAuthFlag = params.get('openAuth');
       const planParam = params.get('plan');
 
-      if (purchasedId) {
-        const record = next.purchasedProperties.find((p) => p.propertyId === purchasedId);
+      const restoreId = historyId || purchasedId;
+      if (restoreId) {
+        const historyRecord = next.analysisHistory?.find((p) => p.propertyId === restoreId);
+        const purchaseRecord = next.purchasedProperties.find((p) => p.propertyId === restoreId);
+        const record = historyRecord || purchaseRecord;
         if (record) {
           setCurrentPropertyId(record.propertyId);
           if (record.sourceText) setInputText(record.sourceText);
           if (record.householdType) setHouseholdType(record.householdType);
           if (record.propertyType) setPropertyType(record.propertyType);
-          if (record.cachedResult) {
-            setResult(record.cachedResult as AnalysisResult);
+          const cached =
+            ('cachedResult' in record ? record.cachedResult : null) ||
+            (purchaseRecord?.cachedResult ?? null);
+          if (cached) {
+            setResult(cached as AnalysisResult);
           }
         }
       }
@@ -562,6 +632,86 @@ export default function Home() {
     writeUserState(next);
   };
 
+  /** Pro 分析結果を履歴へ保存（ローカル + サーバー） */
+  const persistAnalysisHistory = async (params: {
+    propertyId: string;
+    sourceText: string;
+    householdType: HouseholdType;
+    propertyType: PropertyType;
+    cachedResult: AnalysisResult;
+    currentUser: AppUser;
+  }) => {
+    const { propertyId, sourceText, householdType, propertyType, cachedResult, currentUser } =
+      params;
+    const isMonthly = currentUser.plan === 'MONTHLY';
+    const hasSinglePurchase = currentUser.purchasedProperties.some(
+      (p) => p.propertyId === propertyId
+    );
+    if (!isMonthly && !hasSinglePurchase) return currentUser;
+
+    const record: AnalysisHistoryRecord = {
+      propertyId,
+      title: extractPropertyTitle(sourceText || propertyId),
+      locationOrUrl: extractLocationOrUrl(sourceText || propertyId),
+      analyzedAt: new Date().toISOString(),
+      householdType,
+      propertyType,
+      sourceText: sourceText || undefined,
+      cachedResult: cachedResult as AnalysisSnapshot,
+      sourcePlan: isMonthly ? 'MONTHLY' : 'SINGLE',
+    };
+
+    const maxItems = historyLimitForPlan(isMonthly ? 'MONTHLY' : 'FREE');
+    let nextUser: AppUser = {
+      ...currentUser,
+      analysisHistory: upsertAnalysisHistoryRecord(
+        currentUser.analysisHistory || [],
+        record,
+        maxItems
+      ),
+    };
+    persistUser(nextUser);
+
+    try {
+      const res = await fetch('/api/analysis-history', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        cache: 'no-store',
+        body: JSON.stringify({
+          userId: currentUser.userId,
+          propertyId,
+          sourceText,
+          householdType,
+          propertyType,
+          cachedResult,
+          clientPlan: currentUser.plan,
+          hasSinglePurchase,
+        }),
+      });
+      if (res.ok) {
+        const data = (await res.json()) as {
+          analysisHistory?: AnalysisHistoryRecord[];
+          persisted?: string;
+          userId?: string;
+        };
+        if (
+          data.persisted !== 'client_only' &&
+          Array.isArray(data.analysisHistory) &&
+          (!data.userId || data.userId === currentUser.userId)
+        ) {
+          nextUser = {
+            ...nextUser,
+            analysisHistory: data.analysisHistory,
+          };
+          persistUser(nextUser);
+        }
+      }
+    } catch {
+      // ローカル保存済みのためサーバー失敗は握りつぶす
+    }
+    return nextUser;
+  };
+
   const openPaywall = (plan?: PayPlan) => {
     setPaywallMessage(null);
     setPaywallSubmitting(false);
@@ -577,13 +727,15 @@ export default function Home() {
   };
 
   const completeAuthAndContinue = (email: string, provider: 'google' | 'email') => {
-    const next: AppUser = {
-      ...user,
-      email,
-      isLoggedIn: true,
-      authProvider: provider,
-    };
+    const next = loginAsAccountUser({ email, provider, previous: user });
     persistUser(next);
+    // 別アカウントの画面状態が残らないよう診断 UI をリセット
+    setResult(null);
+    setChatMessages([]);
+    setChatInput('');
+    setChatError(null);
+    setCurrentPropertyId(null);
+    setError(null);
     setAuthSubmitting(false);
     setAuthEmail('');
     const intent = authIntent;
@@ -595,29 +747,52 @@ export default function Home() {
     }
     setPendingPayPlan(null);
     setActiveModal(null);
+
+    // 切替後 userId の entitlements を取り直し
+    void (async () => {
+      try {
+        const entRes = await fetch(
+          `/api/entitlements?userId=${encodeURIComponent(next.userId)}`,
+          { cache: 'no-store', headers: { 'Cache-Control': 'no-cache' } }
+        );
+        if (!entRes.ok) return;
+        const ent = await entRes.json();
+        if (ent.userId && ent.userId !== next.userId) return;
+        if (!ent.found) {
+          // サーバー未登録: ローカルのこのアカウント状態を維持（新規は空）
+          return;
+        }
+        const merged = mergeServerEntitlements(next, ent);
+        persistUser(merged);
+      } catch {
+        // ignore
+      }
+    })();
   };
 
   const handleLogout = () => {
-    const next: AppUser = {
-      ...user,
-      email: null,
-      isLoggedIn: false,
-      authProvider: null,
-      plan: 'FREE',
-    };
+    const next = logoutToGuestUser(user);
     persistUser(next);
+    clearClientSessionCaches();
+    setResult(null);
+    setChatMessages([]);
+    setChatInput('');
+    setChatError(null);
+    setCurrentPropertyId(null);
+    setError(null);
     setActiveModal(null);
     setPaywallMessage(null);
   };
 
   const applyDevLoginState = (loggedIn: boolean) => {
     if (loggedIn) {
-      persistUser({
-        ...user,
-        isLoggedIn: true,
-        email: user.email || `dev_${user.userId.slice(-6)}@example.com`,
-        authProvider: user.authProvider || 'email',
+      const email = user.email || `dev_${user.userId.slice(-6)}@example.com`;
+      const next = loginAsAccountUser({
+        email,
+        provider: user.authProvider || 'email',
+        previous: user,
       });
+      persistUser(next);
       return;
     }
     handleLogout();
@@ -682,16 +857,20 @@ export default function Home() {
     setCurrentPropertyId(propertyId);
     setError(null);
     updateUser({
-      purchasedProperties: addPurchasedPropertyRecord(user.purchasedProperties, {
-        propertyId,
-        title: extractPropertyTitle(inputText || propertyId),
-        locationOrUrl: extractLocationOrUrl(inputText || propertyId),
-        purchasedAt: new Date().toISOString(),
-        householdType,
-        propertyType,
-        sourceText: inputText || undefined,
-        cachedResult: (result as AnalysisSnapshot | null) || null,
-      }),
+      purchasedProperties: addPurchasedPropertyRecord(
+        user.purchasedProperties,
+        {
+          propertyId,
+          title: extractPropertyTitle(inputText || propertyId),
+          locationOrUrl: extractLocationOrUrl(inputText || propertyId),
+          purchasedAt: new Date().toISOString(),
+          householdType,
+          propertyType,
+          sourceText: inputText || undefined,
+          cachedResult: (result as AnalysisSnapshot | null) || null,
+        },
+        { singleOnly: true }
+      ),
     });
   };
 
@@ -883,6 +1062,20 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
       setProgressPercent(100);
       setResult(data);
       track('analyze_executed');
+
+      const entitledForHistory =
+        user.plan === 'MONTHLY' ||
+        user.purchasedProperties.some((p) => p.propertyId === propertyId);
+      if (entitledForHistory) {
+        void persistAnalysisHistory({
+          propertyId,
+          sourceText: inputText,
+          householdType,
+          propertyType,
+          cachedResult: data,
+          currentUser: user,
+        });
+      }
     } catch (err: unknown) {
       if (isAbortError(err)) {
         if (analyzeTimedOutRef.current) {
@@ -1178,7 +1371,7 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
       // 決済戻り後に診断結果を復元できるよう一時保存
       try {
         sessionStorage.setItem(
-          'bukken_ai_checkout_context',
+          CHECKOUT_CONTEXT_KEY,
           JSON.stringify({
             propertyId,
             inputText,

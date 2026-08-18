@@ -5,12 +5,21 @@ import { useEffect, useState } from 'react';
 import { SubscriptionManageButton } from '@/components/SubscriptionManageButton';
 import {
   type AppUser,
+  VIEW_HISTORY_QUERY,
   VIEW_PURCHASED_QUERY,
+  clearClientSessionCaches,
   ensureDevDummyPurchases,
+  loginAsAccountUser,
+  logoutToGuestUser,
   mergeServerEntitlements,
   readUserState,
   writeUserState,
 } from '@/lib/plan';
+import {
+  ANALYSIS_HISTORY_LIMIT_MONTHLY,
+  ANALYSIS_HISTORY_LIMIT_SINGLE,
+  ANALYSIS_HISTORY_SAVE_NOTE,
+} from '@/lib/analysis-history';
 import { PRICE_SINGLE_YEN, formatYen } from '@/lib/pricing';
 
 const COLORS = {
@@ -54,13 +63,31 @@ export default function MyPage() {
     }
     setUser(next);
 
+    const requestedUserId = next.userId;
+
     void (async () => {
       try {
-        const res = await fetch(`/api/entitlements?userId=${encodeURIComponent(next.userId)}`);
+        const res = await fetch(
+          `/api/entitlements?userId=${encodeURIComponent(requestedUserId)}`,
+          { cache: 'no-store', headers: { 'Cache-Control': 'no-cache' } }
+        );
         if (!res.ok) return;
         const ent = await res.json();
-        if (!ent.found) return;
-        const merged = mergeServerEntitlements(next, ent);
+        if (ent.userId && ent.userId !== requestedUserId) {
+          console.warn('[mypage] entitlements userId mismatch; ignored', {
+            requestedUserId,
+            remoteUserId: ent.userId,
+          });
+          return;
+        }
+        const latest = readUserState();
+        if (latest.userId !== requestedUserId) return;
+
+        if (!ent.found) {
+          setUser(latest);
+          return;
+        }
+        const merged = mergeServerEntitlements(latest, ent);
         writeUserState(merged);
         setUser(merged);
       } catch {
@@ -81,25 +108,22 @@ export default function MyPage() {
 
   const handleLogout = () => {
     if (!user) return;
-    persist({
-      ...user,
-      email: null,
-      isLoggedIn: false,
-      authProvider: null,
-      plan: 'FREE',
-    });
-    setMessage('ログアウトしました。無料ユーザー状態に戻りました。');
+    const next = logoutToGuestUser(user);
+    persist(next);
+    clearClientSessionCaches();
+    setMessage('ログアウトしました。分析履歴・購入データはアカウントごとに分離して保存されます。');
   };
 
   const applyDevLoginState = (loggedIn: boolean) => {
     if (!user) return;
     if (loggedIn) {
-      persist({
-        ...user,
-        isLoggedIn: true,
-        email: user.email || `dev_${user.userId.slice(-6)}@example.com`,
-        authProvider: user.authProvider || 'email',
+      const email = user.email || `dev_${user.userId.slice(-6)}@example.com`;
+      const next = loginAsAccountUser({
+        email,
+        provider: user.authProvider || 'email',
+        previous: user,
       });
+      persist(next);
       setMessage('DEV: ログイン状態に切り替えました。');
       return;
     }
@@ -305,8 +329,23 @@ export default function MyPage() {
 
       <main style={{ maxWidth: '960px', margin: '0 auto', padding: '28px 20px' }}>
         <h1 style={{ fontSize: '28px', fontWeight: 900, margin: '0 0 8px 0' }}>マイページ</h1>
-        <p style={{ margin: '0 0 24px 0', color: COLORS.textMuted, fontSize: '14px' }}>
-          契約状況と単発購入済み物件を確認できます。
+        <p style={{ margin: '0 0 8px 0', color: COLORS.textMuted, fontSize: '14px' }}>
+          契約状況と分析履歴を確認できます。
+        </p>
+        <p
+          style={{
+            margin: '0 0 24px 0',
+            padding: '12px 14px',
+            borderRadius: '10px',
+            background: '#fffbeb',
+            border: '1px solid #fde68a',
+            color: '#92400e',
+            fontSize: '13px',
+            lineHeight: 1.65,
+          }}
+        >
+          {ANALYSIS_HISTORY_SAVE_NOTE}
+          （単発: 最大{ANALYSIS_HISTORY_LIMIT_SINGLE}件 / 月額Pro: 最大{ANALYSIS_HISTORY_LIMIT_MONTHLY}件）
         </p>
 
         {message && (
@@ -405,19 +444,118 @@ export default function MyPage() {
             borderRadius: '16px',
             padding: '22px',
             boxShadow: COLORS.cardShadow,
+            marginBottom: '20px',
           }}
         >
           <div style={{ display: 'flex', justifyContent: 'space-between', gap: '12px', flexWrap: 'wrap', marginBottom: '14px' }}>
-            <h2 style={{ margin: 0, fontSize: '16px', fontWeight: 800 }}>単発購入済み物件</h2>
+            <h2 style={{ margin: 0, fontSize: '16px', fontWeight: 800 }}>分析履歴</h2>
             <span style={{ fontSize: '12px', color: COLORS.textDim, fontWeight: 700 }}>
-              {user.purchasedProperties.length}件
+              {(user.analysisHistory || []).length}件
+              {user.plan === 'MONTHLY'
+                ? `（上限 ${ANALYSIS_HISTORY_LIMIT_MONTHLY}件）`
+                : `（単発上限 ${ANALYSIS_HISTORY_LIMIT_SINGLE}件）`}
               {IS_DEV ? '（DEVダミー含む場合あり）' : ''}
+            </span>
+          </div>
+
+          {(user.analysisHistory || []).length === 0 ? (
+            <p style={{ margin: 0, color: COLORS.textMuted, fontSize: '14px' }}>
+              まだ保存された分析履歴はありません。月額Pro、または単発{formatYen(PRICE_SINGLE_YEN)}でPro分析を実行するとここに保存されます。
+            </p>
+          ) : (
+            <div style={{ display: 'grid', gap: '14px' }}>
+              {(user.analysisHistory || [])
+                .slice()
+                .sort((a, b) => +new Date(b.analyzedAt) - +new Date(a.analyzedAt))
+                .map((item) => (
+                  <article
+                    key={`${item.propertyId}-${item.analyzedAt}`}
+                    style={{
+                      border: `1px solid ${COLORS.border}`,
+                      borderRadius: '14px',
+                      padding: '16px',
+                      background: COLORS.cardAlt,
+                    }}
+                  >
+                    <div style={{ display: 'flex', justifyContent: 'space-between', gap: '8px', flexWrap: 'wrap', marginBottom: '8px' }}>
+                      <h3 style={{ margin: 0, fontSize: '15px', fontWeight: 800, color: COLORS.text }}>
+                        {item.title}
+                      </h3>
+                      <span
+                        style={{
+                          fontSize: '11px',
+                          fontWeight: 700,
+                          color: item.sourcePlan === 'MONTHLY' ? COLORS.accentStrong : COLORS.accent,
+                          background:
+                            item.sourcePlan === 'MONTHLY'
+                              ? 'rgba(79, 70, 229, 0.08)'
+                              : 'rgba(37, 99, 235, 0.08)',
+                          border: `1px solid ${
+                            item.sourcePlan === 'MONTHLY'
+                              ? 'rgba(79, 70, 229, 0.25)'
+                              : 'rgba(37, 99, 235, 0.25)'
+                          }`,
+                          borderRadius: '999px',
+                          padding: '4px 10px',
+                        }}
+                      >
+                        {item.sourcePlan === 'MONTHLY' ? '月額Pro' : '単発'}
+                      </span>
+                    </div>
+                    <p style={{ margin: '0 0 6px 0', fontSize: '13px', color: COLORS.textMuted, wordBreak: 'break-all' }}>
+                      {item.locationOrUrl}
+                    </p>
+                    <p style={{ margin: '0 0 12px 0', fontSize: '12px', color: COLORS.textDim }}>
+                      分析日時: {formatDate(item.analyzedAt)} ／ 世帯:{' '}
+                      {item.householdType === 'family' ? 'ファミリー' : '一人暮らし'} ／{' '}
+                      {item.propertyType === 'purchase' ? '分譲' : '賃貸'}
+                      {typeof item.cachedResult?.score === 'number'
+                        ? ` ／ スコア: ${item.cachedResult.score}`
+                        : ''}
+                    </p>
+                    <p style={{ margin: '0 0 12px 0', fontSize: '11px', color: COLORS.textDim, wordBreak: 'break-all' }}>
+                      propertyId: {item.propertyId}
+                    </p>
+                    <Link
+                      href={`/?${VIEW_HISTORY_QUERY}=${encodeURIComponent(item.propertyId)}`}
+                      style={{
+                        display: 'inline-block',
+                        background: 'linear-gradient(to right, #4f46e5, #2563eb)',
+                        color: '#fff',
+                        textDecoration: 'none',
+                        fontWeight: 800,
+                        fontSize: '13px',
+                        padding: '10px 14px',
+                        borderRadius: '10px',
+                      }}
+                    >
+                      この分析結果を開く
+                    </Link>
+                  </article>
+                ))}
+            </div>
+          )}
+        </section>
+
+        <section
+          style={{
+            background: COLORS.card,
+            border: `1px solid ${COLORS.border}`,
+            borderRadius: '16px',
+            padding: '22px',
+            boxShadow: COLORS.cardShadow,
+          }}
+        >
+          <div style={{ display: 'flex', justifyContent: 'space-between', gap: '12px', flexWrap: 'wrap', marginBottom: '14px' }}>
+            <h2 style={{ margin: 0, fontSize: '16px', fontWeight: 800 }}>単発Pro購入（権利）</h2>
+            <span style={{ fontSize: '12px', color: COLORS.textDim, fontWeight: 700 }}>
+              {user.purchasedProperties.length}件（最新1件のみ保持）
             </span>
           </div>
 
           {user.purchasedProperties.length === 0 ? (
             <p style={{ margin: 0, color: COLORS.textMuted, fontSize: '14px' }}>
-              まだ単発購入した物件はありません。診断後に単発{formatYen(PRICE_SINGLE_YEN)}プランでPro機能を解放できます。
+              単発{formatYen(PRICE_SINGLE_YEN)}の購入履歴はありません。新規単発購入時は前回の単発権利は上書きされます。
             </p>
           ) : (
             <div style={{ display: 'grid', gap: '14px' }}>
@@ -445,9 +583,6 @@ export default function MyPage() {
                       {item.householdType === 'family' ? 'ファミリー' : '一人暮らし'} ／{' '}
                       {item.propertyType === 'purchase' ? '分譲' : '賃貸'}
                     </p>
-                    <p style={{ margin: '0 0 12px 0', fontSize: '11px', color: COLORS.textDim, wordBreak: 'break-all' }}>
-                      propertyId: {item.propertyId}
-                    </p>
                     <Link
                       href={`/?${VIEW_PURCHASED_QUERY}=${encodeURIComponent(item.propertyId)}`}
                       style={{
@@ -461,7 +596,7 @@ export default function MyPage() {
                         borderRadius: '10px',
                       }}
                     >
-                      この物件のPROレポートを見る
+                      この物件のProレポートを見る
                     </Link>
                   </article>
                 ))}

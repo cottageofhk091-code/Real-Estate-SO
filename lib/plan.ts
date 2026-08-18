@@ -1,3 +1,9 @@
+import {
+  normalizeAnalysisHistoryList,
+  type AnalysisHistoryRecord,
+  type AnalysisHistorySourcePlan,
+} from '@/lib/analysis-history';
+
 export type UserPlan = 'FREE' | 'MONTHLY';
 export type PropertyType = 'rental' | 'purchase';
 export type HouseholdType = 'single' | 'family';
@@ -29,6 +35,8 @@ export type AnalysisSnapshot = {
   futureForecastReport?: string[];
 };
 
+export type { AnalysisHistoryRecord, AnalysisHistorySourcePlan };
+
 export type AppUser = {
   userId: string;
   email: string | null;
@@ -36,16 +44,181 @@ export type AppUser = {
   authProvider: 'google' | 'email' | null;
   plan: UserPlan;
   purchasedProperties: PurchasedPropertyRecord[];
+  /** 分析履歴（単発1件 / 月額Pro 5件） */
+  analysisHistory: AnalysisHistoryRecord[];
   /** Stripe Customer ID（月額解約ポータル用） */
   stripeCustomerId: string | null;
 };
 
 export const USER_STORAGE_KEY = 'bukken_ai_user_state_v3';
 export const VIEW_PURCHASED_QUERY = 'purchasedPropertyId';
+export const VIEW_HISTORY_QUERY = 'analysisHistoryId';
+/** email → userId の対応（アカウント切替用） */
+const ACCOUNT_INDEX_KEY = 'bukken_ai_account_index_v1';
+/** アカウント別スナップショット接頭辞 */
+const ACCOUNT_SNAPSHOT_PREFIX = 'bukken_ai_account_snap_v1:';
+/** チェックアウト一時コンテキスト */
+export const CHECKOUT_CONTEXT_KEY = 'bukken_ai_checkout_context';
 /** 旧キー互換 */
 const LEGACY_V2_KEY = 'bukken_ai_user_state_v2';
 const LEGACY_PLAN_KEY = 'bukken_ai_active_plan';
 const LEGACY_PURCHASED_KEY = 'bukken_ai_purchased_property_ids';
+
+export function normalizeAccountEmail(email: string): string {
+  return String(email || '')
+    .trim()
+    .toLowerCase();
+}
+
+/** セッション系の一時キャッシュを破棄 */
+export function clearClientSessionCaches(): void {
+  try {
+    sessionStorage.removeItem(CHECKOUT_CONTEXT_KEY);
+  } catch {
+    // ignore
+  }
+}
+
+function readAccountIndex(): Record<string, string> {
+  try {
+    const raw = localStorage.getItem(ACCOUNT_INDEX_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    const out: Record<string, string> = {};
+    for (const [k, v] of Object.entries(parsed || {})) {
+      if (typeof v === 'string' && v) out[normalizeAccountEmail(k)] = v;
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+function writeAccountIndex(index: Record<string, string>): void {
+  try {
+    localStorage.setItem(ACCOUNT_INDEX_KEY, JSON.stringify(index));
+  } catch {
+    // ignore
+  }
+}
+
+function accountSnapshotKey(email: string): string {
+  return `${ACCOUNT_SNAPSHOT_PREFIX}${normalizeAccountEmail(email)}`;
+}
+
+/** ログイン中アカウントの状態を email スロットへ退避 */
+export function saveAccountSnapshot(user: AppUser): void {
+  const email = normalizeAccountEmail(user.email || '');
+  if (!email || !user.userId) return;
+  try {
+    const index = readAccountIndex();
+    index[email] = user.userId;
+    writeAccountIndex(index);
+    localStorage.setItem(
+      accountSnapshotKey(email),
+      JSON.stringify(
+        normalizeUser({
+          ...user,
+          email,
+          isLoggedIn: true,
+        })
+      )
+    );
+  } catch {
+    // ignore
+  }
+}
+
+function loadAccountSnapshot(email: string): AppUser | null {
+  const normalized = normalizeAccountEmail(email);
+  if (!normalized) return null;
+  try {
+    const raw = localStorage.getItem(accountSnapshotKey(normalized));
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<AppUser>;
+    return normalizeUser({
+      ...parsed,
+      email: normalized,
+      isLoggedIn: true,
+    });
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * ログアウト: 現アカウントを退避したうえで、履歴・購入・プランを含まないゲストへ切替
+ */
+export function logoutToGuestUser(current: AppUser): AppUser {
+  if (current.isLoggedIn && current.email) {
+    saveAccountSnapshot({ ...current, isLoggedIn: true });
+  }
+  clearClientSessionCaches();
+  const guest = createFreshUser();
+  writeUserState(guest);
+  return guest;
+}
+
+/**
+ * ログイン / アカウント切替:
+ * - 直前アカウントをスナップショット保存
+ * - 同一 email ならそのスナップショットを復元
+ * - 別 email / 初回なら空の新規 userId（前ユーザーの履歴は持ち込まない）
+ */
+export function loginAsAccountUser(params: {
+  email: string;
+  provider: 'google' | 'email';
+  previous: AppUser;
+}): AppUser {
+  const email = normalizeAccountEmail(params.email);
+  if (!email) {
+    return params.previous;
+  }
+
+  // 切替前アカウントを退避（同一 email の再ログイン含む）
+  if (params.previous.isLoggedIn && params.previous.email) {
+    saveAccountSnapshot(params.previous);
+  } else if (params.previous.userId) {
+    // ゲスト中に蓄積した単発/履歴が別アカウントへ漏れないよう破棄してからログイン
+    clearClientSessionCaches();
+  }
+
+  clearClientSessionCaches();
+
+  const index = readAccountIndex();
+  const existingId = index[email];
+  const saved = loadAccountSnapshot(email);
+
+  let next: AppUser;
+  if (saved && saved.userId) {
+    next = normalizeUser({
+      ...saved,
+      email,
+      isLoggedIn: true,
+      authProvider: params.provider,
+      userId: existingId || saved.userId,
+    });
+  } else {
+    const userId = existingId || createGuestUserId();
+    next = normalizeUser({
+      ...createFreshUser(),
+      userId,
+      email,
+      isLoggedIn: true,
+      authProvider: params.provider,
+      plan: 'FREE',
+      purchasedProperties: [],
+      analysisHistory: [],
+      stripeCustomerId: null,
+    });
+  }
+
+  index[email] = next.userId;
+  writeAccountIndex(index);
+  saveAccountSnapshot(next);
+  writeUserState(next);
+  return next;
+}
 
 export function createGuestUserId(): string {
   return `user_${Math.random().toString(36).slice(2, 10)}_${Date.now().toString(36)}`;
@@ -115,9 +288,14 @@ export function canAccessProFeatures(params: {
 
 export function addPurchasedPropertyRecord(
   list: PurchasedPropertyRecord[],
-  record: PurchasedPropertyRecord
+  record: PurchasedPropertyRecord,
+  options?: { singleOnly?: boolean }
 ): PurchasedPropertyRecord[] {
   if (!record.propertyId || record.propertyId === 'prop_empty') return list;
+  // 単発: 常に最新1件のみ（上書き）
+  if (options?.singleOnly) {
+    return [record];
+  }
   const without = list.filter((p) => p.propertyId !== record.propertyId);
   return [...without, record];
 }
@@ -200,10 +378,25 @@ export function createDevDummyPurchases(): PurchasedPropertyRecord[] {
 
 export function ensureDevDummyPurchases(user: AppUser): AppUser {
   if (process.env.NODE_ENV !== 'development') return user;
+  // ログイン済みアカウントにはダミーを入れない（アカウント切替テストの混入防止）
+  if (user.isLoggedIn) return user;
   if (user.purchasedProperties.length > 0) return user;
   const withDummies: AppUser = {
     ...user,
     purchasedProperties: createDevDummyPurchases(),
+    analysisHistory: user.analysisHistory?.length
+      ? user.analysisHistory
+      : createDevDummyPurchases().map((p) => ({
+          propertyId: p.propertyId,
+          title: p.title,
+          locationOrUrl: p.locationOrUrl,
+          analyzedAt: p.purchasedAt,
+          householdType: p.householdType,
+          propertyType: p.propertyType,
+          sourceText: p.sourceText,
+          cachedResult: p.cachedResult,
+          sourcePlan: 'SINGLE' as const,
+        })),
   };
   writeUserState(withDummies);
   return withDummies;
@@ -239,6 +432,7 @@ export function readUserState(): AppUser {
         authProvider: null,
         plan: parsed.plan === 'MONTHLY' ? 'MONTHLY' : 'FREE',
         purchasedProperties: purchased,
+        analysisHistory: [],
         stripeCustomerId: null,
       };
       writeUserState(migrated);
@@ -262,6 +456,7 @@ export function readUserState(): AppUser {
       authProvider: null,
       plan: legacyPlan === 'MONTHLY' ? 'MONTHLY' : 'FREE',
       purchasedProperties: purchased,
+      analysisHistory: [],
       stripeCustomerId: null,
     };
     writeUserState(migrated);
@@ -277,7 +472,11 @@ export function readUserState(): AppUser {
 
 export function writeUserState(user: AppUser) {
   try {
-    localStorage.setItem(USER_STORAGE_KEY, JSON.stringify(normalizeUser(user)));
+    const normalized = normalizeUser(user);
+    localStorage.setItem(USER_STORAGE_KEY, JSON.stringify(normalized));
+    if (normalized.isLoggedIn && normalized.email) {
+      saveAccountSnapshot(normalized);
+    }
   } catch {
     // ignore
   }
@@ -291,6 +490,7 @@ export function createFreshUser(): AppUser {
     authProvider: null,
     plan: 'FREE',
     purchasedProperties: [],
+    analysisHistory: [],
     stripeCustomerId: null,
   };
 }
@@ -342,6 +542,7 @@ function normalizeUser(partial: Partial<AppUser>): AppUser {
         : null,
     plan: partial.plan === 'MONTHLY' ? 'MONTHLY' : 'FREE',
     purchasedProperties: normalizePurchasedList(partial.purchasedProperties),
+    analysisHistory: normalizeAnalysisHistoryList(partial.analysisHistory),
     stripeCustomerId:
       typeof partial.stripeCustomerId === 'string' && partial.stripeCustomerId
         ? partial.stripeCustomerId
@@ -353,18 +554,35 @@ function normalizeUser(partial: Partial<AppUser>): AppUser {
 export function mergeServerEntitlements(
   local: AppUser,
   remote: {
+    userId?: string | null;
+    found?: boolean;
     plan?: UserPlan | string | null;
     stripeCustomerId?: string | null;
     email?: string | null;
     purchasedProperties?: PurchasedPropertyRecord[] | null;
     purchasedPropertyIds?: string[] | null;
+    analysisHistory?: AnalysisHistoryRecord[] | null;
   }
 ): AppUser {
+  // 別ユーザーの entitlements が混入しないよう厳密一致
+  if (remote.userId && remote.userId !== local.userId) {
+    console.warn('[mergeServerEntitlements] userId mismatch; ignoring remote', {
+      local: local.userId,
+      remote: remote.userId,
+    });
+    return local;
+  }
+
   const remotePurchased = normalizePurchasedList(remote.purchasedProperties || []);
   const byId = new Map<string, PurchasedPropertyRecord>();
 
-  for (const item of local.purchasedProperties) {
-    byId.set(item.propertyId, item);
+  // サーバーに見つかった場合は購入・履歴の権威をサーバー側に寄せる（ローカルの別垢混入を防ぐ）
+  const preferRemoteLists = remote.found === true;
+
+  if (!preferRemoteLists) {
+    for (const item of local.purchasedProperties) {
+      byId.set(item.propertyId, item);
+    }
   }
   for (const item of remotePurchased) {
     const prev = byId.get(item.propertyId);
@@ -385,11 +603,41 @@ export function mergeServerEntitlements(
     }
   }
 
+  const remoteHistory = normalizeAnalysisHistoryList(remote.analysisHistory || []);
+  const historyById = new Map<string, AnalysisHistoryRecord>();
+  if (!preferRemoteLists) {
+    for (const item of local.analysisHistory || []) {
+      historyById.set(item.propertyId, item);
+    }
+  }
+  for (const item of remoteHistory) {
+    const prev = historyById.get(item.propertyId);
+    historyById.set(
+      item.propertyId,
+      prev
+        ? {
+            ...item,
+            cachedResult: item.cachedResult ?? prev.cachedResult,
+            sourceText: item.sourceText ?? prev.sourceText,
+          }
+        : item
+    );
+  }
+  // サーバー未登録でも、ログイン直後はローカル履歴を userId 整合の範囲でのみ維持
+  if (preferRemoteLists && remoteHistory.length === 0 && (local.analysisHistory || []).length > 0) {
+    // サーバーが空 = この userId に履歴なし。ローカル混入を捨てる
+  } else if (!preferRemoteLists) {
+    // keep local merged above
+  }
+
   return normalizeUser({
     ...local,
     plan: remote.plan === 'MONTHLY' ? 'MONTHLY' : remote.plan === 'FREE' ? 'FREE' : local.plan,
     stripeCustomerId: remote.stripeCustomerId ?? local.stripeCustomerId,
     email: remote.email || local.email,
     purchasedProperties: Array.from(byId.values()),
+    analysisHistory: Array.from(historyById.values()).sort(
+      (a, b) => +new Date(a.analyzedAt) - +new Date(b.analyzedAt)
+    ),
   });
 }

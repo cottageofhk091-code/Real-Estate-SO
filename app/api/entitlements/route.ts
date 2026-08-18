@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import {
   getServerUser,
+  toClientAnalysisHistory,
   toClientPurchasedRecords,
 } from '@/lib/entitlements';
 import { KvNotConfiguredError, isKvConfigured } from '@/lib/kv';
@@ -21,6 +22,7 @@ function emptyEntitlements(userId: string) {
     email: null,
     purchasedPropertyIds: [] as string[],
     purchasedProperties: [] as ReturnType<typeof toClientPurchasedRecords>,
+    analysisHistory: [] as ReturnType<typeof toClientAnalysisHistory>,
   };
 }
 
@@ -49,7 +51,12 @@ export async function GET(req: Request) {
 
     const record = await getServerUser(userId);
     if (!record) {
-      return NextResponse.json(emptyEntitlements(userId));
+      return NextResponse.json(emptyEntitlements(userId), {
+        headers: {
+          'Cache-Control': 'no-store, no-cache, must-revalidate',
+          Pragma: 'no-cache',
+        },
+      });
     }
 
     const purchasedProperties = toClientPurchasedRecords(
@@ -67,7 +74,13 @@ export async function GET(req: Request) {
       email: record.email || null,
       purchasedPropertyIds: record.purchasedPropertyIds,
       purchasedProperties,
+      analysisHistory: toClientAnalysisHistory(record.analysisHistory),
       updatedAt: record.updatedAt,
+    }, {
+      headers: {
+        'Cache-Control': 'no-store, no-cache, must-revalidate',
+        Pragma: 'no-cache',
+      },
     });
   } catch (error: unknown) {
     console.error('[entitlements] GET error:', error);

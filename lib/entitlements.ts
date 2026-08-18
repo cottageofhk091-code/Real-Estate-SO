@@ -1,3 +1,11 @@
+import type {
+  AnalysisHistoryRecord,
+} from '@/lib/analysis-history';
+import {
+  historyLimitForPlan,
+  normalizeAnalysisHistoryList,
+  upsertAnalysisHistoryRecord,
+} from '@/lib/analysis-history';
 import type { HouseholdType, PropertyType, PurchasedPropertyRecord, UserPlan } from '@/lib/plan';
 import { isKvConfigured, requireRedis } from '@/lib/kv';
 
@@ -30,6 +38,8 @@ export type ServerUserRecord = {
   paymentFailedAt?: string | null;
   purchasedPropertyIds: string[];
   purchasedProperties: ServerPurchasedProperty[];
+  /** 分析履歴（単発1 / 月額5、FIFO） */
+  analysisHistory: AnalysisHistoryRecord[];
   updatedAt: string;
 };
 
@@ -51,6 +61,7 @@ function createDefaultRecord(userId: string): ServerUserRecord {
     paymentFailedAt: null,
     purchasedPropertyIds: [],
     purchasedProperties: [],
+    analysisHistory: [],
     updatedAt: new Date().toISOString(),
   };
 }
@@ -80,6 +91,7 @@ function normalizeRecord(
     purchasedProperties: Array.isArray(raw.purchasedProperties)
       ? raw.purchasedProperties
       : base.purchasedProperties,
+    analysisHistory: normalizeAnalysisHistoryList(raw.analysisHistory),
   };
 }
 
@@ -131,6 +143,7 @@ export async function upsertServerUser(
     userId,
     purchasedPropertyIds: patch.purchasedPropertyIds ?? current.purchasedPropertyIds,
     purchasedProperties: patch.purchasedProperties ?? current.purchasedProperties,
+    analysisHistory: patch.analysisHistory ?? current.analysisHistory,
     updatedAt: new Date().toISOString(),
   };
   return writeUser(next, previousCustomerId);
@@ -155,25 +168,59 @@ export async function addPurchasedPropertyToServerUser(
 ): Promise<ServerUserRecord> {
   const current = (await readUser(userId)) || createDefaultRecord(userId);
   const propertyId = property.propertyId;
-  const purchasedPropertyIds = current.purchasedPropertyIds.includes(propertyId)
-    ? current.purchasedPropertyIds
-    : [...current.purchasedPropertyIds, propertyId];
+  const nextRecord = {
+    ...property,
+    propertyId,
+    purchasedAt: property.purchasedAt || new Date().toISOString(),
+  };
 
-  const without = current.purchasedProperties.filter((p) => p.propertyId !== propertyId);
-  const purchasedProperties = [
-    ...without,
-    {
-      ...property,
-      propertyId,
-      purchasedAt: property.purchasedAt || new Date().toISOString(),
-    },
-  ];
+  // 単発購入は最新1件のみ保持（pending 以外は置き換え）
+  const pendingOnly = current.purchasedProperties.filter((p) =>
+    String(p.propertyId).startsWith('pending:')
+  );
+  const purchasedProperties = [...pendingOnly.filter((p) => p.propertyId !== propertyId), nextRecord];
+  const purchasedPropertyIds = purchasedProperties
+    .map((p) => p.propertyId)
+    .filter((id) => !String(id).startsWith('pending:'));
 
   return writeUser(
     {
       ...current,
       purchasedPropertyIds,
       purchasedProperties,
+      updatedAt: new Date().toISOString(),
+    },
+    current.stripeCustomerId
+  );
+}
+
+/**
+ * Pro 分析結果を履歴へ保存。
+ * - MONTHLY: 最大5件 FIFO
+ * - それ以外（単発 Pro）: 最大1件（上書き）
+ */
+export async function saveAnalysisHistoryToServerUser(
+  userId: string,
+  record: AnalysisHistoryRecord
+): Promise<ServerUserRecord> {
+  const current = (await readUser(userId)) || createDefaultRecord(userId);
+  const sourcePlan = current.plan === 'MONTHLY' ? 'MONTHLY' : 'SINGLE';
+  const maxItems = historyLimitForPlan(current.plan);
+  const nextRecord: AnalysisHistoryRecord = {
+    ...record,
+    sourcePlan,
+    analyzedAt: record.analyzedAt || new Date().toISOString(),
+  };
+  const analysisHistory = upsertAnalysisHistoryRecord(
+    current.analysisHistory || [],
+    nextRecord,
+    maxItems
+  );
+
+  return writeUser(
+    {
+      ...current,
+      analysisHistory,
       updatedAt: new Date().toISOString(),
     },
     current.stripeCustomerId
@@ -315,6 +362,12 @@ export function toClientPurchasedRecords(
       sourceText: p.sourceText,
       cachedResult: null,
     }));
+}
+
+export function toClientAnalysisHistory(
+  history: AnalysisHistoryRecord[] | undefined | null
+): AnalysisHistoryRecord[] {
+  return normalizeAnalysisHistoryList(history || []);
 }
 
 export { isKvConfigured };
