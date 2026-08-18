@@ -1,12 +1,63 @@
 import '@/lib/vercel-fs-guard-init';
 import { NextResponse } from 'next/server';
-import { GEMINI_CHAT_MODELS, generateGeminiContentWithFallback } from '@/lib/gemini';
+import {
+  USER_ERROR_MESSAGES,
+  classifyUpstreamGeminiError,
+  kindFromCode,
+  type ApiErrorKind,
+} from '@/lib/api-errors';
+import {
+  GEMINI_CHAT_MODELS,
+  GeminiFallbackExhaustedError,
+  compactDefined,
+  extractGeminiErrorDetails,
+  generateGeminiContentWithFallback,
+  getGeminiApiKeyDiagnostics,
+  hasGeminiApiKey,
+} from '@/lib/gemini';
+import { emitOpsEventFireAndForget } from '@/lib/ops-events';
 import { installVercelFsGuard, isFilesystemError } from '@/lib/vercel-fs-guard';
 
 installVercelFsGuard();
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
+
+function jsonError(
+  message: string,
+  status: number,
+  extra?: {
+    code?: string;
+    kind?: ApiErrorKind;
+    retryable?: boolean;
+    details?: Record<string, unknown>;
+  }
+) {
+  const code = extra?.code;
+  const kind = extra?.kind ?? kindFromCode(code);
+  const retryable =
+    typeof extra?.retryable === 'boolean' ? extra.retryable : kind === 'temporary' || kind === 'unknown';
+  const userFacing =
+    kind === 'config'
+      ? USER_ERROR_MESSAGES.config
+      : kind === 'temporary'
+        ? USER_ERROR_MESSAGES.temporary
+        : kind === 'client'
+          ? message || USER_ERROR_MESSAGES.client
+          : message || USER_ERROR_MESSAGES.unknown;
+
+  return NextResponse.json(
+    compactDefined({
+      error: userFacing,
+      detail: message !== userFacing ? message : undefined,
+      code,
+      kind,
+      retryable,
+      details: extra?.details ? compactDefined(extra.details) : undefined,
+    }),
+    { status }
+  );
+}
 
 export async function POST(req: Request) {
   installVercelFsGuard();
@@ -22,11 +73,39 @@ export async function POST(req: Request) {
     } = await req.json();
 
     if (!newMessage || typeof newMessage !== 'string' || !newMessage.trim()) {
-      return NextResponse.json({ error: 'メッセージが入力されていません' }, { status: 400 });
+      return jsonError('メッセージが入力されていません', 400, {
+        code: 'REQUEST_INVALID',
+        kind: 'client',
+        retryable: false,
+      });
     }
 
-    if (!process.env.GEMINI_API_KEY) {
-      return NextResponse.json({ error: 'サーバー側の設定エラーです。' }, { status: 500 });
+    const keyDiag = getGeminiApiKeyDiagnostics();
+    console.info('[chat] Gemini API key diagnostics', {
+      at: new Date().toISOString(),
+      ...keyDiag,
+    });
+
+    if (!hasGeminiApiKey()) {
+      console.error('Chat API config error: GEMINI_API_KEY missing', keyDiag);
+      emitOpsEventFireAndForget({
+        code: 'CONFIG_MISSING_GEMINI_API_KEY',
+        severity: 'critical',
+        message: 'GEMINI_API_KEY が未設定のため /api/chat が失敗しました',
+        route: '/api/chat',
+        notify: true,
+        details: { ...keyDiag },
+      });
+      return jsonError(
+        'サーバー側の設定エラーです。GEMINI_API_KEY が未設定です。.env.local に追加して開発サーバーを再起動してください。',
+        500,
+        {
+          code: 'CONFIG_MISSING_GEMINI_API_KEY',
+          kind: 'config',
+          retryable: false,
+          details: { ...keyDiag },
+        }
+      );
     }
 
     const propertyLabel = propertyType === 'purchase' ? '分譲（購入）' : '賃貸';
@@ -89,45 +168,104 @@ ${newMessage.trim()}
 
     let reply: string;
     try {
-      reply = await generateGeminiContentWithFallback(GEMINI_CHAT_MODELS, {
-        prompt,
-        generationConfig: {
-          maxOutputTokens: 1500,
-          temperature: 0.75,
+      const geminiResult = await generateGeminiContentWithFallback(
+        GEMINI_CHAT_MODELS,
+        {
+          prompt,
+          generationConfig: {
+            maxOutputTokens: 1500,
+            temperature: 0.75,
+          },
         },
+        { route: '/api/chat' }
+      );
+      reply = geminiResult.text;
+      console.info('[chat] Gemini success', {
+        at: new Date().toISOString(),
+        modelUsed: geminiResult.modelUsed,
+        attempts: geminiResult.attempts.length,
       });
     } catch (chatError: unknown) {
       if (isFilesystemError(chatError)) {
         console.warn('FS write skipped (during Gemini chat)', chatError);
-        return NextResponse.json(
-          {
-            error:
-              '一時的なサーバー環境エラーが発生しました。お手数ですが、もう一度お試しください。',
-          },
-          { status: 503 }
+        return jsonError(
+          '一時的なサーバー環境エラーが発生しました。お手数ですが、もう一度お試しください。',
+          503,
+          { code: 'SERVER_ENV_ERROR', kind: 'temporary', retryable: true }
         );
       }
+
+      if (chatError instanceof GeminiFallbackExhaustedError) {
+        return jsonError(chatError.message, 503, {
+          code: 'GEMINI_ALL_MODELS_FAILED',
+          kind: 'temporary',
+          retryable: true,
+          details: {
+            summary: chatError.lastDetails.summary,
+            status: chatError.lastDetails.status,
+            attempts: chatError.attempts,
+            modelsTried: [...GEMINI_CHAT_MODELS],
+          },
+        });
+      }
+
       throw chatError;
     }
 
     return NextResponse.json({ reply: reply.trim() });
   } catch (error: unknown) {
-    console.error('Chat route error:', error);
+    const details = extractGeminiErrorDetails(error);
+    console.error(
+      'Chat route error:',
+      compactDefined({
+        at: new Date().toISOString(),
+        summary: details.summary,
+        message: details.message,
+        status: details.status,
+        statusText: details.statusText,
+        statusCode: details.statusCode,
+        responseBody: details.responseBody,
+        errorDetails: details.errorDetails,
+      })
+    );
     if (isFilesystemError(error)) {
       console.warn('FS write skipped (chat top-level)', error);
-      return NextResponse.json(
-        {
-          error:
-            '一時的なサーバー環境エラーが発生しました。お手数ですが、もう一度お試しください。',
-        },
-        { status: 503 }
+      return jsonError(
+        '一時的なサーバー環境エラーが発生しました。お手数ですが、もう一度お試しください。',
+        503,
+        { code: 'SERVER_ENV_ERROR', kind: 'temporary', retryable: true }
       );
     }
-    const message = error instanceof Error ? error.message : '内部エラーが発生しました';
-    let status = 500;
-    if (/quota|429|resource.?exhausted|rate.?limit/i.test(message)) status = 429;
-    else if (/404|not found|is not found/i.test(message)) status = 404;
-    else if (/timeout|timed?\s*out|deadline/i.test(message)) status = 504;
-    return NextResponse.json({ error: message }, { status });
+
+    const classified = classifyUpstreamGeminiError({
+      status: details.status,
+      message: details.message,
+    });
+    emitOpsEventFireAndForget({
+      code: classified.code,
+      severity: classified.kind === 'config' ? 'critical' : 'error',
+      message: details.summary || details.message,
+      route: '/api/chat',
+      notify: true,
+      details: compactDefined({
+        status: details.status,
+        statusText: details.statusText,
+        modelsTried: [...GEMINI_CHAT_MODELS],
+      }),
+    });
+
+    return jsonError(details.summary || details.message, classified.httpStatus, {
+      code: classified.code,
+      kind: classified.kind,
+      retryable: classified.kind === 'temporary',
+      details: compactDefined({
+        summary: details.summary,
+        status: details.status,
+        statusText: details.statusText,
+        statusCode: details.statusCode,
+        responseBody: details.responseBody,
+        modelsTried: [...GEMINI_CHAT_MODELS],
+      }),
+    });
   }
 }

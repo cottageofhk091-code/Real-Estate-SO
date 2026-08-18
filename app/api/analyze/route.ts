@@ -1,6 +1,21 @@
 import '@/lib/vercel-fs-guard-init';
 import { NextResponse } from 'next/server';
-import { GEMINI_ANALYZE_MODELS, generateGeminiContentWithFallback } from '@/lib/gemini';
+import {
+  USER_ERROR_MESSAGES,
+  classifyUpstreamGeminiError,
+  kindFromCode,
+  type ApiErrorKind,
+} from '@/lib/api-errors';
+import {
+  GEMINI_ANALYZE_MODELS,
+  GeminiFallbackExhaustedError,
+  compactDefined,
+  extractGeminiErrorDetails,
+  generateGeminiContentWithFallback,
+  getGeminiApiKeyDiagnostics,
+  hasGeminiApiKey,
+} from '@/lib/gemini';
+import { emitOpsEventFireAndForget } from '@/lib/ops-events';
 import { installVercelFsGuard, isFilesystemError } from '@/lib/vercel-fs-guard';
 
 try {
@@ -24,6 +39,7 @@ function labelHouseholdType(type: HouseholdType | string | undefined): string {
 }
 
 function logAnalyzeError(label: string, error: unknown): void {
+  const details = extractGeminiErrorDetails(error);
   const err = error as {
     message?: unknown;
     stack?: unknown;
@@ -31,29 +47,57 @@ function logAnalyzeError(label: string, error: unknown): void {
     code?: unknown;
     cause?: unknown;
   };
-  console.error('Analyze API Error details:', error);
-  console.error(label, {
-    message: error instanceof Error ? error.message : String(error),
-    stack: error instanceof Error ? error.stack : undefined,
-    name: error instanceof Error ? error.name : typeof error,
-    code: err?.code,
-    cause: err?.cause,
-  });
-}
-
-function statusForErrorMessage(message: string): number {
-  if (/quota|429|resource.?exhausted|rate.?limit/i.test(message)) return 429;
-  if (/404|not found|is not found/i.test(message)) return 404;
-  if (/timeout|timed?\s*out|deadline/i.test(message)) return 504;
-  if (/ENOENT|EACCES|EROFS|mkdir|\/var\/task\/data/i.test(message)) return 503;
-  return 500;
-}
-
-function jsonError(message: string, status?: number) {
-  return NextResponse.json(
-    { error: message || '分析処理中にエラーが発生しました。' },
-    { status: status ?? statusForErrorMessage(message) }
+  console.error('Analyze API Error details:', details.summary || error);
+  console.error(
+    label,
+    compactDefined({
+      at: new Date().toISOString(),
+      summary: details.summary,
+      message: details.message || (error instanceof Error ? error.message : String(error)),
+      stack: error instanceof Error ? error.stack : undefined,
+      name: error instanceof Error ? error.name : typeof error,
+      code: err?.code ?? details.statusCode,
+      cause: err?.cause,
+      httpStatus: details.status,
+      statusText: details.statusText,
+      responseBody: details.responseBody,
+      errorDetails: details.errorDetails,
+    })
   );
+}
+
+function jsonError(
+  message: string,
+  status: number,
+  extra?: {
+    code?: string;
+    kind?: ApiErrorKind;
+    retryable?: boolean;
+    details?: Record<string, unknown>;
+  }
+) {
+  const code = extra?.code;
+  const kind = extra?.kind ?? kindFromCode(code);
+  const retryable =
+    typeof extra?.retryable === 'boolean' ? extra.retryable : kind === 'temporary' || kind === 'unknown';
+  const userFacing =
+    kind === 'config'
+      ? USER_ERROR_MESSAGES.config
+      : kind === 'temporary'
+        ? USER_ERROR_MESSAGES.temporary
+        : kind === 'client'
+          ? message || USER_ERROR_MESSAGES.client
+          : message || USER_ERROR_MESSAGES.unknown;
+
+  const payload = compactDefined({
+    error: userFacing,
+    detail: message !== userFacing ? message : undefined,
+    code,
+    kind,
+    retryable,
+    details: extra?.details ? compactDefined(extra.details) : undefined,
+  });
+  return NextResponse.json(payload, { status });
 }
 
 /**
@@ -80,7 +124,11 @@ export async function POST(req: Request) {
       body = (await req.json()) as typeof body;
     } catch (parseBodyError: unknown) {
       logAnalyzeError('Analyze API body parse error:', parseBodyError);
-      return jsonError('リクエストボディの解析に失敗しました。', 400);
+      return jsonError('リクエストボディの解析に失敗しました。', 400, {
+        code: 'REQUEST_INVALID',
+        kind: 'client',
+        retryable: false,
+      });
     }
 
     const text = typeof body.text === 'string' ? body.text : '';
@@ -89,12 +137,48 @@ export async function POST(req: Request) {
     const householdType = body.householdType;
 
     if (!text && (!images || (Array.isArray(images) && images.length === 0))) {
-      return jsonError('テキストまたは画像を入力してください。', 400);
+      return jsonError('テキストまたは画像を入力してください。', 400, {
+        code: 'REQUEST_INVALID',
+        kind: 'client',
+        retryable: false,
+      });
     }
 
-    if (!process.env.GEMINI_API_KEY) {
-      logAnalyzeError('Analyze API config error:', new Error('GEMINI_API_KEY missing'));
-      return jsonError('サーバー側の設定エラーです。', 500);
+    const keyDiag = getGeminiApiKeyDiagnostics();
+    console.info('[analyze] Gemini API key diagnostics', {
+      at: new Date().toISOString(),
+      ...keyDiag,
+    });
+
+    if (!hasGeminiApiKey()) {
+      logAnalyzeError(
+        'Analyze API config error:',
+        new Error('GEMINI_API_KEY missing (also checked GOOGLE_GENERATIVE_AI_API_KEY / GOOGLE_API_KEY)')
+      );
+      emitOpsEventFireAndForget({
+        code: 'CONFIG_MISSING_GEMINI_API_KEY',
+        severity: 'critical',
+        message: 'GEMINI_API_KEY が未設定のため /api/analyze が失敗しました',
+        route: '/api/analyze',
+        notify: true,
+        details: { ...keyDiag },
+      });
+      return jsonError(
+        'サーバー側の設定エラーです。GEMINI_API_KEY が未設定です。.env.local に追加して開発サーバーを再起動してください。',
+        500,
+        {
+          code: 'CONFIG_MISSING_GEMINI_API_KEY',
+          kind: 'config',
+          retryable: false,
+          details: { ...keyDiag },
+        }
+      );
+    }
+
+    if (keyDiag.looksQuoted) {
+      console.warn(
+        '[analyze] GEMINI_API_KEY appears wrapped in quotes. Remove surrounding quotes in .env.local.'
+      );
     }
 
     const propertyLabel = labelPropertyType(propertyType as PropertyType | string | undefined);
@@ -193,12 +277,22 @@ ${text || 'なし'}
 
     let responseText = '';
     try {
-      responseText = await generateGeminiContentWithFallback(GEMINI_ANALYZE_MODELS, {
-        prompt,
-        images: imageParts,
-        generationConfig: {
-          responseMimeType: 'application/json',
+      const geminiResult = await generateGeminiContentWithFallback(
+        GEMINI_ANALYZE_MODELS,
+        {
+          prompt,
+          images: imageParts,
+          generationConfig: {
+            responseMimeType: 'application/json',
+          },
         },
+        { route: '/api/analyze' }
+      );
+      responseText = geminiResult.text;
+      console.info('[analyze] Gemini success', {
+        at: new Date().toISOString(),
+        modelUsed: geminiResult.modelUsed,
+        attempts: geminiResult.attempts.length,
       });
     } catch (geminiError: unknown) {
       logAnalyzeError('Analyze API Gemini error:', geminiError);
@@ -206,14 +300,68 @@ ${text || 'なし'}
         console.warn('FS write skipped (during Gemini analyze)', geminiError);
         return jsonError(
           '一時的なサーバー環境エラーが発生しました。お手数ですが、もう一度お試しください。',
-          503
+          503,
+          { code: 'SERVER_ENV_ERROR', kind: 'temporary', retryable: true }
         );
       }
-      const message =
-        geminiError instanceof Error
-          ? geminiError.message
-          : 'Gemini API 呼び出し中にエラーが発生しました。';
-      return jsonError(message, statusForErrorMessage(message));
+
+      if (geminiError instanceof GeminiFallbackExhaustedError) {
+        return jsonError(geminiError.message, 503, {
+          code: 'GEMINI_ALL_MODELS_FAILED',
+          kind: 'temporary',
+          retryable: true,
+          details: {
+            summary: geminiError.lastDetails.summary,
+            status: geminiError.lastDetails.status,
+            statusText: geminiError.lastDetails.statusText,
+            attempts: geminiError.attempts,
+            modelsTried: [...GEMINI_ANALYZE_MODELS],
+          },
+        });
+      }
+
+      const details = extractGeminiErrorDetails(geminiError);
+      const classified = classifyUpstreamGeminiError({
+        status: details.status,
+        message: details.message,
+      });
+      console.error(
+        '[analyze] Gemini upstream failure',
+        compactDefined({
+          at: new Date().toISOString(),
+          summary: details.summary,
+          status: details.status,
+          statusText: details.statusText,
+          kind: classified.kind,
+          code: classified.code,
+          modelsTried: [...GEMINI_ANALYZE_MODELS],
+        })
+      );
+      emitOpsEventFireAndForget({
+        code: classified.code,
+        severity: classified.kind === 'config' ? 'critical' : 'error',
+        message: details.summary || details.message,
+        route: '/api/analyze',
+        notify: true,
+        details: compactDefined({
+          status: details.status,
+          statusText: details.statusText,
+          modelsTried: [...GEMINI_ANALYZE_MODELS],
+        }),
+      });
+      return jsonError(details.summary || details.message, classified.httpStatus, {
+        code: classified.code,
+        kind: classified.kind,
+        retryable: classified.kind === 'temporary',
+        details: compactDefined({
+          summary: details.summary,
+          status: details.status,
+          statusText: details.statusText,
+          statusCode: details.statusCode,
+          responseBody: details.responseBody,
+          modelsTried: [...GEMINI_ANALYZE_MODELS],
+        }),
+      });
     }
 
     let parsedData: Record<string, unknown>;
@@ -221,7 +369,18 @@ ${text || 'なし'}
       parsedData = JSON.parse(responseText) as Record<string, unknown>;
     } catch (parseError: unknown) {
       logAnalyzeError('Analyze API JSON parse error:', parseError);
-      return jsonError('分析結果の解析に失敗しました。もう一度お試しください。', 502);
+      emitOpsEventFireAndForget({
+        code: 'PARSE_FAILED',
+        severity: 'error',
+        message: 'Gemini 応答の JSON 解析に失敗しました',
+        route: '/api/analyze',
+        notify: true,
+      });
+      return jsonError('分析結果の解析に失敗しました。もう一度お試しください。', 502, {
+        code: 'PARSE_FAILED',
+        kind: 'temporary',
+        retryable: true,
+      });
     }
 
     // 旧フィールド互換（失敗してもレスポンスは返す）
@@ -245,12 +404,27 @@ ${text || 'なし'}
       console.warn('FS write skipped (analyze top-level)', error);
       return jsonError(
         '一時的なサーバー環境エラーが発生しました。お手数ですが、もう一度お試しください。',
-        503
+        503,
+        { code: 'SERVER_ENV_ERROR', kind: 'temporary', retryable: true }
       );
     }
 
-    const message =
-      error instanceof Error ? error.message : '分析処理中にエラーが発生しました。';
-    return jsonError(message, statusForErrorMessage(message));
+    const details = extractGeminiErrorDetails(error);
+    const classified = classifyUpstreamGeminiError({
+      status: details.status,
+      message: details.message,
+    });
+    emitOpsEventFireAndForget({
+      code: 'ANALYZE_FAILED',
+      severity: 'error',
+      message: details.summary || details.message,
+      route: '/api/analyze',
+      notify: true,
+    });
+    return jsonError(details.summary || details.message, classified.httpStatus, {
+      code: classified.code,
+      kind: classified.kind,
+      retryable: classified.kind === 'temporary',
+    });
   }
 }

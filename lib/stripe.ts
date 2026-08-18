@@ -96,7 +96,7 @@ export type CheckoutLineItem =
       };
     };
 
-/** 単発500円の price_data ラインアイテムを生成 */
+/** 単発300円の price_data ラインアイテムを生成 */
 export function buildSinglePriceDataLineItem(propertyId: string): CheckoutLineItem {
   return {
     quantity: 1,
@@ -104,8 +104,8 @@ export function buildSinglePriceDataLineItem(propertyId: string): CheckoutLineIt
       currency: 'jpy',
       unit_amount: PRICE_SINGLE_YEN,
       product_data: {
-        name: '不動産セカンドオピニオンAI（単発）',
-        description: `1物件PRO診断買い切り（税込${PRICE_SINGLE_YEN}円 / propertyId: ${propertyId}）`,
+        name: '不動産セカンドオピニオンAI（単発Pro）',
+        description: `1物件Pro詳細分析（税込${PRICE_SINGLE_YEN}円 / propertyId: ${propertyId}）`,
       },
     },
   };
@@ -113,7 +113,8 @@ export function buildSinglePriceDataLineItem(propertyId: string): CheckoutLineIt
 
 /**
  * 単発 Checkout 用ラインアイテム。
- * STRIPE_PRICE_ID_SINGLE が有効ならそれを使い、未設定・不存在・無効時は price_data(500円) へフォールバック。
+ * STRIPE_PRICE_ID_SINGLE が有効かつ金額が PRICE_SINGLE_YEN と一致すればそれを使い、
+ * 未設定・不存在・金額不一致時は price_data へフォールバック。
  */
 export async function resolveSingleCheckoutLineItem(
   stripe: Stripe,
@@ -146,6 +147,12 @@ export async function resolveSingleCheckoutLineItem(
       );
       return fallback;
     }
+    if (price.unit_amount !== PRICE_SINGLE_YEN) {
+      console.warn(
+        `[checkout] STRIPE_PRICE_ID_SINGLE=${priceId} unit_amount=${price.unit_amount} != ${PRICE_SINGLE_YEN}; falling back to price_data`
+      );
+      return fallback;
+    }
     return { quantity: 1, price: price.id };
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
@@ -175,7 +182,7 @@ export async function resolveFirstMonthCouponId(stripe: Stripe): Promise<string>
 
   const created = await stripe.coupons.create({
     id: FIRST_MONTH_COUPON_FALLBACK_ID,
-    name: '初月割引（500円）',
+    name: `初月割引（${PRICE_MONTHLY_FIRST_YEN}円）`,
     amount_off: PRICE_MONTHLY_FIRST_DISCOUNT_YEN,
     currency: 'jpy',
     duration: 'once',

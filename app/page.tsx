@@ -55,12 +55,12 @@ const FORM_INPUT_HINT =
   '💡 情報（賃料、共益費、駅徒歩、設備、気になっている点など）が多ければ多いほど、AIがより詳細で精度の高い分析を行います。';
 const INPUT_TEXT_MAX_LENGTH = 3000;
 const INPUT_TEXT_WARN_LENGTH = 2800;
-const FREE_TRIAL_LIMIT = 3;
-const FREE_TRIAL_STORAGE_KEY = 'bukken_ai_free_trials_remaining';
 const SERVICE_DISCLAIMER =
   '⚠️ 免責事項：本サービスの分析・回答はAIによる推計であり、物件の契約や価値を保証するものではありません。最終的な契約・判断は必ずご自身の責任において、信頼できる不動産会社等にご確認のうえ行ってください。';
 const API_FALLBACK_MESSAGE =
-  '現在アクセスが集中しているか、一時的なエラーが発生しました。お手数ですが、もう一度お試しいただくか、サポートまでご連絡ください。';
+  '現在アクセスが集中しているか、AIサービス側で一時的な障害が発生しています。お手数ですが、しばらくしてからもう一度お試しください。';
+const API_CONFIG_MESSAGE =
+  'サービス設定に問題があります。管理者にお問い合わせください。開発環境では GEMINI_API_KEY が .env.local に設定されているか確認してください。';
 const ANALYZE_TIMEOUT_MS = 90_000;
 const CHAT_TIMEOUT_MS = 60_000;
 
@@ -161,11 +161,73 @@ function isAbortError(err: unknown): boolean {
   return false;
 }
 
-function isRetryableApiFailure(status: number, rawMessage: string): boolean {
-  if ([408, 404, 429, 500, 502, 503, 504].includes(status)) return true;
+function isRetryableApiFailure(
+  status: number,
+  rawMessage: string,
+  code?: string,
+  kind?: string,
+  retryableFlag?: boolean
+): boolean {
+  if (typeof retryableFlag === 'boolean') return retryableFlag;
+  if (kind === 'config' || kind === 'client') return false;
+  if (kind === 'temporary') return true;
+  // サーバー設定ミスはリトライしても直らない
+  if (
+    code === 'CONFIG_MISSING_GEMINI_API_KEY' ||
+    code === 'CONFIG_INVALID_GEMINI_API_KEY' ||
+    /GEMINI_API_KEY|設定エラー|設定されていません/i.test(rawMessage)
+  ) {
+    return false;
+  }
+  if ([408, 404, 429, 502, 503, 504].includes(status)) return true;
+  // 500 でも設定系は除外済み。一時障害のみリトライ扱い
+  if (status === 500) {
+    return /quota|rate.?limit|timeout|timed?\s*out|econnreset|fetch failed|network|overloaded|unavailable|resource.?exhausted/i.test(
+      rawMessage
+    );
+  }
   return /quota|rate.?limit|timeout|timed?\s*out|econnreset|fetch failed|network|404|not found|resource.?exhausted|overloaded|unavailable/i.test(
     rawMessage
   );
+}
+
+function resolveApiErrorDisplay(input: {
+  status: number;
+  error?: string;
+  detail?: string;
+  code?: string;
+  kind?: string;
+  retryable?: boolean;
+}): { message: string; retryable: boolean } {
+  const kind = input.kind;
+  const raw = input.error || `エラーが発生しました（${input.status}）`;
+  const retryable = isRetryableApiFailure(
+    input.status,
+    raw,
+    input.code,
+    kind,
+    input.retryable
+  );
+
+  if (kind === 'config' || input.code?.startsWith('CONFIG_')) {
+    return {
+      message: IS_DEV && input.detail ? input.detail : input.error || API_CONFIG_MESSAGE,
+      retryable: false,
+    };
+  }
+
+  if (kind === 'client') {
+    return { message: raw, retryable: false };
+  }
+
+  if (retryable || kind === 'temporary') {
+    return {
+      message: IS_DEV && input.detail ? `${API_FALLBACK_MESSAGE}\n（詳細: ${input.detail.slice(0, 240)}）` : API_FALLBACK_MESSAGE,
+      retryable: true,
+    };
+  }
+
+  return { message: raw, retryable: false };
 }
 
 function DisclaimerNotice({ compact = false }: { compact?: boolean }) {
@@ -270,10 +332,6 @@ export default function Home() {
   const [propertyType, setPropertyType] = useState<PropertyType>('rental');
   const [householdType, setHouseholdType] = useState<HouseholdType>('single');
 
-  // 無料診断回数（PROコンテンツのお試し解放枠）
-  const [freeTrialsLeft, setFreeTrialsLeft] = useState(FREE_TRIAL_LIMIT);
-  // 無料枠で今回の診断結果を解放したか（月額・単発購入とは別）
-  const [freeTrialUnlockedForResult, setFreeTrialUnlockedForResult] = useState(false);
   // userId / plan / purchasedProperties
   const [user, setUser] = useState<AppUser>({
     userId: 'user_guest',
@@ -320,21 +378,8 @@ export default function Home() {
     historyBeforeSend: ChatMessage[];
   } | null>(null);
 
-  // LocalStorage から無料回数・ユーザー状態を復元
+  // LocalStorage からユーザー状態を復元
   useEffect(() => {
-    try {
-      const stored = localStorage.getItem(FREE_TRIAL_STORAGE_KEY);
-      if (stored === null) {
-        localStorage.setItem(FREE_TRIAL_STORAGE_KEY, String(FREE_TRIAL_LIMIT));
-        setFreeTrialsLeft(FREE_TRIAL_LIMIT);
-      } else {
-        const parsed = Number.parseInt(stored, 10);
-        setFreeTrialsLeft(Number.isFinite(parsed) ? Math.max(0, Math.min(FREE_TRIAL_LIMIT, parsed)) : FREE_TRIAL_LIMIT);
-      }
-    } catch {
-      setFreeTrialsLeft(FREE_TRIAL_LIMIT);
-    }
-
     let next = readUserState();
     if (IS_DEV) {
       next = ensureDevDummyPurchases(next);
@@ -389,7 +434,6 @@ export default function Home() {
                   if (ctx.propertyType) setPropertyType(ctx.propertyType);
                   if (ctx.cachedResult) {
                     setResult(ctx.cachedResult);
-                    setFreeTrialUnlockedForResult(false);
                   }
                 }
                 sessionStorage.removeItem('bukken_ai_checkout_context');
@@ -450,7 +494,6 @@ export default function Home() {
           if (record.propertyType) setPropertyType(record.propertyType);
           if (record.cachedResult) {
             setResult(record.cachedResult as AnalysisResult);
-            setFreeTrialUnlockedForResult(false);
           }
         }
       }
@@ -608,33 +651,6 @@ export default function Home() {
     persistUser({ ...user, ...patch });
   };
 
-  const unlockFreeTrialForCurrent = () => {
-    setFreeTrialUnlockedForResult(true);
-  };
-
-  const consumeFreeTrial = () => {
-    setFreeTrialsLeft((prev) => {
-      const next = Math.max(0, prev - 1);
-      try {
-        localStorage.setItem(FREE_TRIAL_STORAGE_KEY, String(next));
-      } catch {
-        // ignore storage errors
-      }
-      return next;
-    });
-  };
-
-  const resetFreeTrialsForDev = () => {
-    if (!IS_DEV) return;
-    try {
-      localStorage.setItem(FREE_TRIAL_STORAGE_KEY, String(FREE_TRIAL_LIMIT));
-    } catch {
-      // ignore storage errors
-    }
-    setFreeTrialsLeft(FREE_TRIAL_LIMIT);
-    setError(null);
-  };
-
   /** DEV: 月額 / 無料へ切替（FREE時は購入履歴もクリアして初期化） */
   const applyDevPlan = (plan: UserPlan) => {
     if (!IS_DEV) return;
@@ -648,7 +664,6 @@ export default function Home() {
       plan: 'FREE',
       purchasedProperties: [],
     });
-    setFreeTrialUnlockedForResult(false);
     setPaywallMessage(null);
   };
 
@@ -712,7 +727,6 @@ export default function Home() {
     setError(null);
     setErrorRetryable(false);
     setCurrentPropertyId(null);
-    setFreeTrialUnlockedForResult(false);
     setChatMessages([]);
     setChatInput('');
     setChatError(null);
@@ -793,13 +807,6 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
     const propertyId = buildPropertyId(inputText);
     setCurrentPropertyId(propertyId);
 
-    const isMonthly = user.plan === 'MONTHLY';
-    const isPurchased = user.purchasedProperties.some((p) => p.propertyId === propertyId);
-    const hasFreeTrial = freeTrialsLeft > 0;
-    // 月額 / 単発購入済み / 無料お試し枠
-    const entitledBySubscriptionOrPurchase = isMonthly || isPurchased;
-    const entitledByFreeTrial = !entitledBySubscriptionOrPurchase && hasFreeTrial;
-
     try {
       const res = await fetch('/api/analyze', {
         method: 'POST',
@@ -813,19 +820,60 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
         }),
       });
 
-      let data: (AnalysisResult & { error?: string }) | null = null;
+      let data: (AnalysisResult & {
+        error?: string;
+        detail?: string;
+        code?: string;
+        kind?: string;
+        retryable?: boolean;
+        details?: unknown;
+      }) | null = null;
       try {
-        data = (await res.json()) as AnalysisResult & { error?: string };
-      } catch {
+        data = (await res.json()) as AnalysisResult & {
+          error?: string;
+          detail?: string;
+          code?: string;
+          kind?: string;
+          retryable?: boolean;
+          details?: unknown;
+        };
+      } catch (parseErr) {
+        console.error('[analyze] failed to parse JSON response', {
+          status: res.status,
+          statusText: res.statusText,
+          parseErr,
+        });
         throw Object.assign(new Error(API_FALLBACK_MESSAGE), { retryable: true });
       }
 
       if (!res.ok) {
-        const raw = typeof data?.error === 'string' ? data.error : `解析に失敗しました（${res.status}）`;
-        if (isRetryableApiFailure(res.status, raw)) {
-          throw Object.assign(new Error(API_FALLBACK_MESSAGE), { retryable: true });
-        }
-        throw Object.assign(new Error(raw), { retryable: false });
+        const display = resolveApiErrorDisplay({
+          status: res.status,
+          error: data?.error,
+          detail: data?.detail,
+          code: data?.code,
+          kind: data?.kind,
+          retryable: data?.retryable,
+        });
+        console.error(
+          '[analyze] API error response',
+          JSON.stringify(
+            {
+              status: res.status,
+              statusText: res.statusText,
+              code: data?.code ?? null,
+              kind: data?.kind ?? null,
+              retryable: display.retryable,
+              error: data?.error ?? null,
+              detail: data?.detail ?? null,
+              details: data?.details ?? null,
+              body: data,
+            },
+            null,
+            2
+          )
+        );
+        throw Object.assign(new Error(display.message), { retryable: display.retryable });
       }
 
       if (!data || typeof data.score !== 'number') {
@@ -835,16 +883,11 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
       setProgressPercent(100);
       setResult(data);
       track('analyze_executed');
-      setFreeTrialUnlockedForResult(entitledByFreeTrial);
-      if (entitledByFreeTrial) {
-        consumeFreeTrial();
-      }
     } catch (err: unknown) {
       if (isAbortError(err)) {
         if (analyzeTimedOutRef.current) {
           setError(API_FALLBACK_MESSAGE);
           setErrorRetryable(true);
-          setFreeTrialUnlockedForResult(false);
         }
         return;
       }
@@ -856,9 +899,8 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
       const isNetworkLike =
         /failed to fetch|networkerror|load failed|network/i.test(message) ||
         message === 'Failed to fetch';
-      setError(isNetworkLike || retryable ? API_FALLBACK_MESSAGE : message);
+      setError(isNetworkLike ? API_FALLBACK_MESSAGE : message);
       setErrorRetryable(retryable || isNetworkLike);
-      setFreeTrialUnlockedForResult(false);
     } finally {
       window.clearTimeout(timeoutId);
       if (analyzeAbortRef.current === controller) {
@@ -903,19 +945,62 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
         }),
       });
 
-      let data: { reply?: string; error?: string } | null = null;
+      let data: {
+        reply?: string;
+        error?: string;
+        detail?: string;
+        code?: string;
+        kind?: string;
+        retryable?: boolean;
+        details?: unknown;
+      } | null = null;
       try {
-        data = (await res.json()) as { reply?: string; error?: string };
-      } catch {
+        data = (await res.json()) as {
+          reply?: string;
+          error?: string;
+          detail?: string;
+          code?: string;
+          kind?: string;
+          retryable?: boolean;
+          details?: unknown;
+        };
+      } catch (parseErr) {
+        console.error('[chat] failed to parse JSON response', {
+          status: res.status,
+          statusText: res.statusText,
+          parseErr,
+        });
         throw Object.assign(new Error(API_FALLBACK_MESSAGE), { retryable: true });
       }
 
       if (!res.ok) {
-        const raw = typeof data?.error === 'string' ? data.error : `チャット応答の取得に失敗しました（${res.status}）`;
-        if (isRetryableApiFailure(res.status, raw)) {
-          throw Object.assign(new Error(API_FALLBACK_MESSAGE), { retryable: true });
-        }
-        throw Object.assign(new Error(raw), { retryable: false });
+        const display = resolveApiErrorDisplay({
+          status: res.status,
+          error: data?.error,
+          detail: data?.detail,
+          code: data?.code,
+          kind: data?.kind,
+          retryable: data?.retryable,
+        });
+        console.error(
+          '[chat] API error response',
+          JSON.stringify(
+            {
+              status: res.status,
+              statusText: res.statusText,
+              code: data?.code ?? null,
+              kind: data?.kind ?? null,
+              retryable: display.retryable,
+              error: data?.error ?? null,
+              detail: data?.detail ?? null,
+              details: data?.details ?? null,
+              body: data,
+            },
+            null,
+            2
+          )
+        );
+        throw Object.assign(new Error(display.message), { retryable: display.retryable });
       }
 
       setChatMessages((prev) => [
@@ -939,7 +1024,7 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
       const isNetworkLike =
         /failed to fetch|networkerror|load failed|network/i.test(messageText) ||
         messageText === 'Failed to fetch';
-      setChatError(isNetworkLike || retryable ? API_FALLBACK_MESSAGE : messageText);
+      setChatError(isNetworkLike ? API_FALLBACK_MESSAGE : messageText);
       setChatErrorRetryable(retryable || isNetworkLike);
     } finally {
       window.clearTimeout(timeoutId);
@@ -1144,7 +1229,7 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
 
   // 1) user.plan === MONTHLY → 全物件解放
   // 2) purchasedProperties.includes(currentPropertyId) → 当該物件のみ解放
-  // 3) それ以外は無料枠解放（上限到達時はロック）
+  // 3) それ以外は基本分析のみ（Pro は課金が必要）
   const isProUser = user.plan === 'MONTHLY';
   const isCurrentPropertyPurchased =
     !!currentPropertyId &&
@@ -1152,7 +1237,6 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
   const isProContentLocked = !canAccessProFeatures({
     user,
     currentPropertyId,
-    freeTrialUnlockedForResult,
   });
 
   const planStatusLabel =
@@ -1194,19 +1278,27 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
     textAlign: 'center',
   });
 
-  const trialBadgeStyle: CSSProperties = {
+  const planBadgeStyle: CSSProperties = {
     fontSize: '12px',
     fontWeight: 700,
-    color: freeTrialsLeft > 0 ? COLORS.accent : '#dc2626',
-    backgroundColor: freeTrialsLeft > 0 ? 'rgba(37, 99, 235, 0.08)' : 'rgba(220, 38, 38, 0.08)',
+    color: isProUser || isCurrentPropertyPurchased ? COLORS.accent : COLORS.textMuted,
+    backgroundColor:
+      isProUser || isCurrentPropertyPurchased
+        ? 'rgba(37, 99, 235, 0.08)'
+        : 'rgba(100, 116, 139, 0.08)',
     padding: '6px 12px',
     borderRadius: '999px',
-    border: `1px solid ${freeTrialsLeft > 0 ? 'rgba(37, 99, 235, 0.25)' : 'rgba(220, 38, 38, 0.25)'}`,
+    border: `1px solid ${
+      isProUser || isCurrentPropertyPurchased
+        ? 'rgba(37, 99, 235, 0.25)'
+        : 'rgba(100, 116, 139, 0.25)'
+    }`,
     whiteSpace: 'nowrap',
   };
 
   const planCardStyle = (active: boolean): CSSProperties => ({
     flex: 1,
+    minWidth: '140px',
     textAlign: 'left',
     padding: '14px 16px',
     borderRadius: '12px',
@@ -1216,6 +1308,17 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
     color: COLORS.text,
     boxShadow: active ? 'none' : COLORS.cardShadow,
   });
+
+  const freePlanCardStyle: CSSProperties = {
+    flex: 1,
+    minWidth: '140px',
+    textAlign: 'left',
+    padding: '14px 16px',
+    borderRadius: '12px',
+    backgroundColor: COLORS.cardAlt,
+    border: `1px solid ${COLORS.border}`,
+    color: COLORS.text,
+  };
 
   const inputStyle: CSSProperties = {
     width: '100%',
@@ -1254,7 +1357,7 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
       {!locked && (
         <div style={{ marginBottom: '12px' }}>
           <span style={{ fontSize: '11px', fontWeight: 700, color: COLORS.accent, backgroundColor: 'rgba(37, 99, 235, 0.08)', padding: '4px 10px', borderRadius: '999px', border: '1px solid rgba(37, 99, 235, 0.2)' }}>
-            PRO限定・無料体験中
+            PRO限定
           </span>
         </div>
       )}
@@ -1291,7 +1394,7 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
         >
           <span style={{ fontSize: '28px' }}>🔒</span>
           <p style={{ margin: 0, fontSize: '16px', fontWeight: 800, color: COLORS.text }}>
-            PRO登録で表示
+            Pro機能で表示
           </p>
           <button
             type="button"
@@ -1308,7 +1411,7 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
               boxShadow: '0 8px 20px rgba(37, 99, 235, 0.25)',
             }}
           >
-            ロック解除する
+            単発{formatYen(PRICE_SINGLE_YEN)} / 月額で解放
           </button>
         </div>
       )}
@@ -1473,12 +1576,12 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
             </span>
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap' }}>
-            <span style={trialBadgeStyle}>
+            <span style={planBadgeStyle}>
               {isProUser
-                ? '月額PRO会員'
+                ? '月額Pro会員'
                 : isCurrentPropertyPurchased
-                  ? '単発購入済み（この物件）'
-                  : `無料お試し残り：${freeTrialsLeft}回`}
+                  ? '単発Pro購入済み（この物件）'
+                  : '無料プラン（基本分析・無制限）'}
             </span>
             <span
               style={{
@@ -1494,26 +1597,6 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
             >
               {planStatusLabel}
             </span>
-            {IS_DEV && (
-              <button
-                type="button"
-                onClick={resetFreeTrialsForDev}
-                style={{
-                  fontSize: '11px',
-                  fontWeight: 700,
-                  color: '#b45309',
-                  backgroundColor: '#fffbeb',
-                  padding: '6px 10px',
-                  borderRadius: '8px',
-                  border: '1px dashed #f59e0b',
-                  cursor: 'pointer',
-                  whiteSpace: 'nowrap',
-                }}
-                title="開発環境のみ表示。LocalStorageの無料枠を3に戻します"
-              >
-                [DEV] 無料枠を3回にリセット
-              </button>
-            )}
             {user.isLoggedIn ? (
               <>
                 <button
@@ -1591,7 +1674,7 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
                 cursor: stripeTestLoading ? 'not-allowed' : 'pointer',
               }}
             >
-              {stripeTestLoading === 'SINGLE' ? 'リダイレクト中...' : '💳 単発500円 Checkout を開く'}
+              {stripeTestLoading === 'SINGLE' ? 'リダイレクト中...' : `💳 単発${formatYen(PRICE_SINGLE_YEN)} Checkout を開く`}
             </button>
             <button
               type="button"
@@ -1675,7 +1758,7 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
               </h2>
             </div>
             <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-              <span style={trialBadgeStyle}>無料お試し残り：{freeTrialsLeft}回</span>
+              <span style={planBadgeStyle}>基本分析は無料・回数無制限</span>
               {(inputText || imagePreviews.length > 0 || result) && (
                 <button
                   onClick={handleReset}
@@ -1827,11 +1910,9 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
             )
           )}
 
-          {freeTrialsLeft <= 0 && (
-            <div style={{ marginTop: '16px', padding: '12px 14px', backgroundColor: '#eef2ff', border: '1px solid #c7d2fe', color: '#3730a3', fontSize: '13px', borderRadius: '10px' }}>
-              基本診断（スコア・メリット・リスク・詳細分析）は無料のままご利用できます。PRO限定4機能（AIチャット・内見チェック・履歴トラッキング・将来予測）の解放にはPRO登録が必要です。
-            </div>
-          )}
+          <div style={{ marginTop: '16px', padding: '12px 14px', backgroundColor: '#eef2ff', border: '1px solid #c7d2fe', color: '#3730a3', fontSize: '13px', borderRadius: '10px' }}>
+            基本診断（スコア・メリット・リスク・詳細分析）は無料・回数無制限です。Pro限定4機能（AIチャット・内見チェック・履歴トラッキング・将来予測）は、単発{formatYen(PRICE_SINGLE_YEN)}または月額（初月{formatYen(PRICE_MONTHLY_FIRST_YEN)}）で解放できます。
+          </div>
 
           <button
             onClick={handleAnalyze}
@@ -1980,7 +2061,7 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
               <h3 style={{ margin: 0, fontSize: '16px', fontWeight: 800, color: COLORS.text }}>
                 PRO限定コンテンツ（4機能）
               </h3>
-              <span style={trialBadgeStyle}>無料お試し残り：{freeTrialsLeft}回</span>
+              <span style={planBadgeStyle}>基本分析は無料・回数無制限</span>
             </div>
 
             <div style={{ display: 'flex', flexDirection: 'column', gap: '20px', width: '100%' }}>
@@ -2003,7 +2084,7 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
               {!isProContentLocked && (
                 <div style={{ marginBottom: '12px' }}>
                   <span style={{ fontSize: '11px', fontWeight: 700, color: COLORS.accent, backgroundColor: 'rgba(37, 99, 235, 0.08)', padding: '4px 10px', borderRadius: '999px', border: '1px solid rgba(37, 99, 235, 0.2)' }}>
-                    PRO限定①・無料体験中
+                    PRO限定①
                   </span>
                 </div>
               )}
@@ -2117,7 +2198,7 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
                   }}
                 >
                   <span style={{ fontSize: '28px' }}>🔒</span>
-                  <p style={{ margin: 0, fontSize: '16px', fontWeight: 800, color: COLORS.text }}>PRO登録で表示</p>
+                  <p style={{ margin: 0, fontSize: '16px', fontWeight: 800, color: COLORS.text }}>Pro機能で表示</p>
                   <button
                     type="button"
                     onClick={() => openPaywall()}
@@ -2132,7 +2213,7 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
                       fontSize: '13px',
                     }}
                   >
-                    ロック解除する
+                    単発{formatYen(PRICE_SINGLE_YEN)} / 月額で解放
                   </button>
                 </div>
               )}
@@ -2153,7 +2234,7 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
               <section style={{ backgroundColor: '#fffbeb', border: '1px solid #fde68a', padding: '28px', borderRadius: '20px', boxShadow: COLORS.cardShadow, height: '100%', boxSizing: 'border-box', overflow: 'auto' }}>
                 <div style={{ marginBottom: '12px' }}>
                   <span style={{ fontSize: '11px', fontWeight: 700, color: COLORS.accent, backgroundColor: 'rgba(37, 99, 235, 0.08)', padding: '4px 10px', borderRadius: '999px', border: '1px solid rgba(37, 99, 235, 0.2)' }}>
-                    PRO限定②・無料体験中
+                    PRO限定②
                   </span>
                 </div>
                 <h3 style={{ fontSize: '18px', fontWeight: 'bold', color: '#b45309', margin: '0 0 16px 0', display: 'flex', alignItems: 'center', gap: '8px' }}>
@@ -2192,7 +2273,7 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
         {/* 6. PROプラン訴求 */}
         <section style={{ marginTop: '60px', backgroundColor: COLORS.card, padding: '36px 28px', borderRadius: '24px', border: '1px solid #c7d2fe', boxShadow: '0 4px 6px -1px rgba(0,0,0,0.05), 0 0 24px rgba(79, 70, 229, 0.08)', textAlign: 'center' }}>
           <span style={{ color: '#4338ca', fontSize: '12px', fontWeight: 'bold', letterSpacing: '1px', backgroundColor: '#eef2ff', padding: '6px 14px', borderRadius: '20px', border: '1px solid #c7d2fe' }}>
-            基本診断は無料無制限 / PROお試し残り{freeTrialsLeft}回
+            基本診断は無料・回数無制限 / Pro詳細は単発{formatYen(PRICE_SINGLE_YEN)}〜
           </span>
           <h2 style={{ fontSize: '24px', fontWeight: 'bold', color: COLORS.text, margin: '16px 0 12px 0' }}>
             「絶対に損したくない」あなたのためのPRO限定4機能
@@ -2218,7 +2299,7 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
             onClick={() => openPaywall()}
             style={{ marginTop: '32px', background: 'linear-gradient(to right, #4f46e5, #2563eb)', color: '#ffffff', fontWeight: '800', padding: '14px 32px', borderRadius: '30px', border: 'none', cursor: 'pointer', fontSize: '15px', boxShadow: '0 4px 18px rgba(37, 99, 235, 0.3)' }}
           >
-            ✨ PROプランに登録する
+            ✨ Proプランを確認する
           </button>
         </section>
       </main>
@@ -2428,7 +2509,7 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
                     },
                     {
                       t: '■ 販売価格',
-                      b: `・単発プラン：${formatYen(PRICE_SINGLE_YEN)}（税込）\n・PRO月額プラン：初月${formatYen(PRICE_MONTHLY_FIRST_YEN)}（税込）、2ヶ月目以降 ${formatYen(PRICE_MONTHLY_YEN)}/月（税込）`,
+                      b: `・無料プラン：0円（基本AI分析・回数無制限）\n・単発Pro機能：${formatYen(PRICE_SINGLE_YEN)}（税込）\n・月額Proプラン：初月${formatYen(PRICE_MONTHLY_FIRST_YEN)}（税込）、2ヶ月目以降 ${formatYen(PRICE_MONTHLY_YEN)}/月（税込）`,
                     },
                     {
                       t: '■ 商品代金以外の必要料金',
@@ -2664,11 +2745,11 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
                   ) : (
                     <form onSubmit={handlePaywallSubmit} style={{ display: 'flex', flexDirection: 'column', gap: '18px' }}>
                       <p style={{ margin: 0, fontSize: '13px', color: COLORS.textDim }}>
-                        無料枠を使い切ったあとも、無制限に診断できるプランをご用意しています。
+                        基本AI分析は無料・回数無制限です。Pro詳細分析（周辺相場・リスク深掘り等）は単発または月額でご利用ください。
                       </p>
                       {isProUser && (
                         <div style={{ padding: '12px 14px', borderRadius: '10px', backgroundColor: '#f0fdf4', border: '1px solid #bbf7d0', color: '#166534', fontSize: '13px', lineHeight: 1.6 }}>
-                          現在は月額PRO会員です。解約・お支払い方法の変更は、アンケート回答後の Stripe 契約管理ページから行えます。
+                          現在は月額Pro会員です。解約・お支払い方法の変更は、アンケート回答後の Stripe 契約管理ページから行えます。
                           <div style={{ marginTop: '10px' }}>
                             <SubscriptionManageButton
                               mode="manage"
@@ -2687,18 +2768,27 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
                           プラン選択 <span style={{ color: '#ef4444' }}>*</span>
                         </label>
                         <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap' }}>
-                          <button type="button" onClick={() => setSelectedPlan('ticket')} style={planCardStyle(selectedPlan === 'ticket')}>
-                            <div style={{ fontSize: '12px', color: COLORS.textDim, marginBottom: '4px' }}>【単発プラン】</div>
-                            <div style={{ fontWeight: 800, fontSize: '15px' }}>{formatYen(PRICE_SINGLE_YEN)} / 1物件診断</div>
+                          <div style={freePlanCardStyle}>
+                            <div style={{ fontSize: '12px', color: COLORS.textDim, marginBottom: '4px' }}>【無料プラン】</div>
+                            <div style={{ fontWeight: 800, fontSize: '15px' }}>0円 / 回数無制限</div>
                             <div style={{ marginTop: '6px', fontSize: '12px', color: COLORS.textMuted, lineHeight: 1.5 }}>
-                              買い切り・自動更新なし（この物件のPRO機能を解放）
+                              基本的なAI分析・アドバイスをすべて利用可能（ログイン不要）
+                            </div>
+                          </div>
+                          <button type="button" onClick={() => setSelectedPlan('ticket')} style={planCardStyle(selectedPlan === 'ticket')}>
+                            <div style={{ fontSize: '12px', color: COLORS.textDim, marginBottom: '4px' }}>【単発 Pro機能】</div>
+                            <div style={{ fontWeight: 800, fontSize: '15px' }}>{formatYen(PRICE_SINGLE_YEN)} / 1回</div>
+                            <div style={{ marginTop: '6px', fontSize: '12px', color: COLORS.textMuted, lineHeight: 1.5 }}>
+                              周辺相場・リスク深掘りなどPro詳細分析を1物件分解放（買い切り）
                             </div>
                           </button>
                           <button type="button" onClick={() => setSelectedPlan('pro')} style={planCardStyle(selectedPlan === 'pro')}>
-                            <div style={{ fontSize: '12px', color: COLORS.textDim, marginBottom: '4px' }}>【PRO月額プラン】</div>
-                            <div style={{ fontWeight: 800, fontSize: '15px', color: COLORS.accentStrong }}>{formatYen(PRICE_MONTHLY_YEN)} / 月</div>
+                            <div style={{ fontSize: '12px', color: COLORS.textDim, marginBottom: '4px' }}>【月額 Proプラン】</div>
+                            <div style={{ fontWeight: 800, fontSize: '15px', color: COLORS.accentStrong }}>
+                              初月{formatYen(PRICE_MONTHLY_FIRST_YEN)}
+                            </div>
                             <div style={{ marginTop: '6px', fontSize: '12px', color: COLORS.textMuted, lineHeight: 1.5 }}>
-                              初月{formatYen(PRICE_MONTHLY_FIRST_YEN)}・全物件のPRO機能を解放・いつでも解約可能
+                              2ヶ月目以降 {formatYen(PRICE_MONTHLY_YEN)}/月・全物件のPro詳細が使い放題・いつでも解約可
                             </div>
                           </button>
                         </div>
@@ -2764,8 +2854,8 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
                         {paywallSubmitting
                           ? 'Stripeへ移動中...'
                           : selectedPlan === 'ticket'
-                            ? '今すぐ単発プランを購入（Stripe）'
-                            : '今すぐPRO月額に登録（Stripe）'}
+                            ? `今すぐ単発Pro（${formatYen(PRICE_SINGLE_YEN)}）を購入`
+                            : `今すぐ月額Pro（初月${formatYen(PRICE_MONTHLY_FIRST_YEN)}）に登録`}
                       </button>
 
                       <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', fontSize: '11px', color: COLORS.textDim, lineHeight: 1.65 }}>

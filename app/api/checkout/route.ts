@@ -154,7 +154,7 @@ export async function POST(req: Request) {
             recurring: { interval: 'month' },
             product_data: {
               name: '不動産セカンドオピニオンAI（月額）',
-              description: `月額${PRICE_MONTHLY_YEN.toLocaleString('ja-JP')}円（税込）/ 初月${PRICE_MONTHLY_FIRST_YEN}円 / 全物件PRO機能解放`,
+              description: `月額${PRICE_MONTHLY_YEN.toLocaleString('ja-JP')}円（税込）/ 初月${PRICE_MONTHLY_FIRST_YEN}円 / 全物件Pro詳細分析が使い放題`,
             },
           },
         },

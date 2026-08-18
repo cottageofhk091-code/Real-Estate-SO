@@ -11,6 +11,7 @@ import {
   readUserState,
   writeUserState,
 } from '@/lib/plan';
+import { PRICE_SINGLE_YEN, formatYen } from '@/lib/pricing';
 
 const COLORS = {
   pageBg: '#f8fafc',
@@ -357,7 +358,7 @@ export default function MyPage() {
             <div>
               <span style={{ color: COLORS.textDim, fontSize: '12px' }}>現在の契約プラン</span>
               <div style={{ fontWeight: 800, color: COLORS.accentStrong, fontSize: '18px' }}>
-                {user.plan === 'MONTHLY' ? 'MONTHLY（月額PRO）' : 'FREE（無料 / 単発購入可）'}
+                {user.plan === 'MONTHLY' ? 'MONTHLY（月額Pro）' : 'FREE（無料・基本分析無制限 / 単発Pro購入可）'}
               </div>
             </div>
           </div>
@@ -416,7 +417,7 @@ export default function MyPage() {
 
           {user.purchasedProperties.length === 0 ? (
             <p style={{ margin: 0, color: COLORS.textMuted, fontSize: '14px' }}>
-              まだ単発購入した物件はありません。診断後に単発500円プランでPRO機能を解放できます。
+              まだ単発購入した物件はありません。診断後に単発{formatYen(PRICE_SINGLE_YEN)}プランでPro機能を解放できます。
             </p>
           ) : (
             <div style={{ display: 'grid', gap: '14px' }}>

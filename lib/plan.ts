@@ -98,9 +98,8 @@ export function extractLocationOrUrl(sourceText: string): string {
 export function canAccessProFeatures(params: {
   user: AppUser;
   currentPropertyId: string | null;
-  freeTrialUnlockedForResult: boolean;
 }): boolean {
-  const { user, currentPropertyId, freeTrialUnlockedForResult } = params;
+  const { user, currentPropertyId } = params;
 
   if (user.plan === 'MONTHLY') return true;
 
@@ -111,7 +110,7 @@ export function canAccessProFeatures(params: {
     return true;
   }
 
-  return freeTrialUnlockedForResult;
+  return false;
 }
 
 export function addPurchasedPropertyRecord(
