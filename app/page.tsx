@@ -85,7 +85,7 @@ const PRO_FEATURES_BASE = [
   {
     icon: '💬',
     title: '【PRO機能①】専属AIアドバイザーと本音チャット相談',
-    body: '物件データを前提に、結論→根拠→具体アドバイスまでフランクな本音で直言します。',
+    body: '物件分析に加え、住宅ローンの審査チェックや投資物件の収益化確率まで、結論→根拠→具体アドバイスで直言します。',
   },
   {
     icon: '📋',
@@ -1902,17 +1902,18 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
       <section style={{ textAlign: 'center', padding: '60px 20px 40px', background: 'radial-gradient(circle at top, rgba(37, 99, 235, 0.08) 0%, rgba(248, 250, 252, 0) 70%)' }}>
         <div style={{ maxWidth: '800px', margin: '0 auto' }}>
           <span style={{ color: COLORS.accent, fontSize: '13px', fontWeight: 'bold', letterSpacing: '2px', textTransform: 'uppercase', display: 'block', marginBottom: '12px' }}>
-            不動産屋の営業トークに惑わされない
+            物件査定からローン・投資相談まで
           </span>
-          <h1 style={{ fontSize: '32px', fontWeight: '900', color: COLORS.text, lineHeight: '1.3', marginBottom: '16px' }}>
+          <h1 style={{ fontSize: 'clamp(26px, 5vw, 32px)', fontWeight: '900', color: COLORS.text, lineHeight: '1.35', marginBottom: '16px' }}>
             AI不動産プロ査定で<br />
             <span style={{ background: 'linear-gradient(to right, #2563eb, #4f46e5)', WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent' }}>
               「隠されたリスク」
             </span>
             を即時に完全見抜く
           </h1>
-          <p style={{ color: COLORS.textMuted, fontSize: '15px', lineHeight: '1.6', maxWidth: '600px', margin: '0 auto' }}>
-            SUUMOやHOME&apos;Sのテキスト、間取り図画像を貼り付けるだけ。不動産鑑定士並みのロジックで適正相場・潜むデメリット・内見チェックポイントをAIが自動診断します。
+          <p style={{ color: COLORS.textMuted, fontSize: '15px', lineHeight: '1.75', maxWidth: '640px', margin: '0 auto', padding: '0 4px' }}>
+            物件の分析はもちろん、住宅ローンの審査対策や投資物件の収益化相談まで、専属AIアドバイザーがトータルサポート。
+            SUUMOやHOME&apos;Sのテキスト・間取り図を貼り付けるだけで、適正相場・デメリット・内見チェックもスピーディに診断します。
           </p>
         </div>
       </section>
@@ -2286,12 +2287,12 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
                   💬 【PRO機能①】専属AIアドバイザーと本音チャット相談
                 </h3>
                 <p style={{ fontSize: '13px', color: COLORS.textMuted, margin: '0 0 16px 0' }}>
-                  結論→根拠→具体アドバイスまで、フランクな本音で答えます。
+                  物件分析はもちろん、住宅ローンの審査チェックや投資物件の収益化相談まで、フランクな本音で答えます。
                 </p>
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '10px', flex: 1, minHeight: '180px', maxHeight: '260px', overflowY: 'auto', marginBottom: '14px', padding: '12px', backgroundColor: COLORS.cardAlt, borderRadius: '12px', border: `1px solid ${COLORS.border}` }}>
                   {chatMessages.length === 0 && (
                     <p style={{ margin: 0, fontSize: '13px', color: COLORS.textDim }}>
-                      例：「この家賃は交渉できそう？」「ファミリー向けの懸念点は？」
+                      例：「ローン審査で見られやすい点は？」「投資用として利回りは現実的？」
                     </p>
                   )}
                   {chatMessages.map((msg, idx) => (
