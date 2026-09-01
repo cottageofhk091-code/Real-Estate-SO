@@ -2699,7 +2699,7 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
                     },
                     {
                       t: '■ お問い合わせ先',
-                      b: 'サイト内「お問い合わせ」フォームよりご連絡ください。\n（メールアドレス等の詳細情報は、ご請求いただければ遅滞なく開示いたします）',
+                      b: 'サイト内「お問い合わせ」フォーム、または support@cloudflowriver.com よりご連絡ください。',
                     },
                     {
                       t: '■ 販売価格',
@@ -2755,7 +2755,7 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
                     },
                     {
                       t: '5. お問い合わせ窓口',
-                      b: '個人情報の取り扱いに関するお問い合わせは、サイト内のお問い合わせフォームよりご連絡ください。',
+                      b: '個人情報の取り扱いに関するお問い合わせは、サイト内のお問い合わせフォーム、または support@cloudflowriver.com よりご連絡ください。',
                     },
                   ].map((item) => (
                     <div key={item.t} style={{ backgroundColor: COLORS.cardAlt, padding: '16px', borderRadius: '12px', border: `1px solid ${COLORS.border}` }}>

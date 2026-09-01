@@ -162,10 +162,10 @@ export default function SiteInfoModal({ type, onClose }: SiteInfoModalProps) {
               <p className="text-center text-[11px] text-slate-500">
                 または{" "}
                 <a
-                  href="mailto:support@ai-property-analyzer.example"
+                  href="mailto:support@cloudflowriver.com"
                   className="font-medium text-indigo-700 underline-offset-2 hover:underline"
                 >
-                  support@ai-property-analyzer.example
+                  support@cloudflowriver.com
                 </a>{" "}
                 まで直接ご連絡ください。
               </p>
