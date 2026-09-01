@@ -1,7 +1,6 @@
 import { NextResponse } from 'next/server';
 
 const APP_NAME = '不動産セカンドオピニオンAI';
-/** お問い合わせ通知の既定宛先 */
 const DEFAULT_CONTACT_EMAIL = 'support@cloudflowriver.com';
 
 function getContactEmail(): string {
@@ -11,7 +10,6 @@ function getContactEmail(): string {
 function getContactFromEmail(): string {
   const from = process.env.CONTACT_FROM_EMAIL?.trim();
   if (from) return from;
-  // Resend 等で検証済みの送信元。未設定時は同ドメインの noreply を想定
   return `${APP_NAME} <noreply@cloudflowriver.com>`;
 }
 
@@ -86,39 +84,6 @@ async function sendContactEmail(params: {
   }
 }
 
-/** 任意: Discord 併用通知（CONTACT メールが主経路） */
-async function sendOptionalDiscordNotify(params: {
-  name: string;
-  email: string;
-  type: string;
-  message: string;
-}): Promise<void> {
-  const webhookUrl = process.env.DISCORD_WEBHOOK_URL?.trim();
-  if (!webhookUrl) return;
-
-  try {
-    const res = await fetch(webhookUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        username: `${APP_NAME} サポート`,
-        content: [
-          `📩 **${APP_NAME}** お問い合わせ（メール通知済み）`,
-          `種別: ${params.type || '（未選択）'}`,
-          `From: ${params.email}`,
-          `名前: ${params.name}`,
-        ].join('\n'),
-      }),
-    });
-    if (!res.ok) {
-      const body = await res.text().catch(() => '');
-      console.warn('[contact] optional Discord notify failed:', res.status, body);
-    }
-  } catch (err) {
-    console.warn('[contact] optional Discord notify error:', err);
-  }
-}
-
 export async function POST(request: Request) {
   try {
     const { name, email, type, message } = await request.json();
@@ -145,14 +110,6 @@ export async function POST(request: Request) {
       to: contactEmail,
       replyTo: trimmedEmail,
       name: displayName,
-      type: inquiryType,
-      message: inquiryMessage,
-    });
-
-    // 失敗してもメール通知は成功扱い（補助チャネル）
-    void sendOptionalDiscordNotify({
-      name: displayName,
-      email: trimmedEmail,
       type: inquiryType,
       message: inquiryMessage,
     });
