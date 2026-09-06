@@ -1021,8 +1021,8 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
     setChatInput('');
     setChatError(null);
     setChatErrorRetryable(false);
-    // 再分析開始時は成功パスをクリア（リロードなし）
-    clearAnalyzeSuccessPath();
+    // 分析開始時に確実にURLを一旦リセット（連続分析でも /success の PV が毎回発火するようにする）
+    router.replace('/', { scroll: false });
 
     const propertyId = buildPropertyId(inputText);
     setCurrentPropertyId(propertyId);
