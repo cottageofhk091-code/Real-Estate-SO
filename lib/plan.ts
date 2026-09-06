@@ -273,6 +273,7 @@ export function canAccessProFeatures(params: {
   currentPropertyId: string | null;
 }): boolean {
   const { user, currentPropertyId } = params;
+  if (!user) return false;
 
   if (user.plan === 'MONTHLY') return true;
 
