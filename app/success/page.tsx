@@ -1,12 +1,23 @@
 "use client";
 
 import Link from "next/link";
-import { CheckCircle2 } from "lucide-react";
 
 export default function SuccessPage() {
   return (
     <div className="mx-auto flex max-w-xl flex-col items-center px-4 py-16 text-center">
-      <CheckCircle2 className="h-16 w-16 text-emerald-500" />
+      <svg
+        className="h-16 w-16 text-emerald-500"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        aria-hidden="true"
+      >
+        <circle cx="12" cy="12" r="10" />
+        <path d="m9 12 2 2 4-4" />
+      </svg>
       <h1 className="mt-4 text-2xl font-bold text-slate-900 dark:text-white">
         分析が完了しました！
       </h1>
