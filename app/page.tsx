@@ -1,6 +1,7 @@
 'use client';
 
 import { useState, useEffect, useRef, type CSSProperties, type FormEvent, type ChangeEvent } from 'react';
+import { useRouter } from 'next/navigation';
 import { track } from '@vercel/analytics';
 import { SubscriptionManageButton } from '@/components/SubscriptionManageButton';
 import {
@@ -93,30 +94,6 @@ function writeAnalysisCount(count: number): void {
     localStorage.setItem(ANALYSIS_COUNT_STORAGE_KEY, String(Math.max(0, count)));
   } catch {
     // ignore quota / private mode
-  }
-}
-
-/** 画面リロードなしでクエリだけ付与（分析成功トラッキング用） */
-function setAnalyzeSuccessQuery(): void {
-  try {
-    const url = new URL(window.location.href);
-    url.searchParams.set('result', 'success');
-    window.history.replaceState(null, '', url.toString());
-  } catch (err) {
-    console.warn('[analyze] failed to set result=success query', err);
-  }
-}
-
-/** クリア / 再分析開始時に ?result=success を除去 */
-function clearAnalyzeResultQuery(): void {
-  try {
-    const url = new URL(window.location.href);
-    if (!url.searchParams.has('result')) return;
-    url.searchParams.delete('result');
-    const next = `${url.pathname}${url.search}${url.hash}` || url.pathname || '/';
-    window.history.replaceState(null, '', next);
-  } catch (err) {
-    console.warn('[analyze] failed to clear result query', err);
   }
 }
 
@@ -375,6 +352,7 @@ function ApiErrorPanel({
 }
 
 export default function Home() {
+  const router = useRouter();
   const [inputText, setInputText] = useState('');
   const [images, setImages] = useState<{ inlineData: { mimeType: string; data: string } }[]>([]);
   const [imagePreviews, setImagePreviews] = useState<string[]>([]);
@@ -947,6 +925,18 @@ export default function Home() {
     setImagePreviews((prev) => prev.filter((_, i) => i !== index));
   };
 
+  const clearAnalyzeResultQuery = () => {
+    try {
+      if (typeof window === 'undefined') return;
+      const params = new URLSearchParams(window.location.search);
+      if (!params.has('result')) return;
+      // App Router 経由でクエリを消す（スクロール位置は維持）
+      router.replace(window.location.pathname || '/', { scroll: false });
+    } catch (err) {
+      console.warn('[analyze] failed to clear result query', err);
+    }
+  };
+
   const handleReset = () => {
     clearAnalyzeResultQuery();
     setInputText('');
@@ -1120,7 +1110,8 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
       setAnalysisCount(newCount);
       writeAnalysisCount(newCount);
       console.log('分析成功: URLを更新します', newCount);
-      setAnalyzeSuccessQuery();
+      // App Router 経由で URL を更新（Vercel Web Analytics のページ集計に反映）
+      router.replace('/?result=success', { scroll: false });
 
       try {
         track('analyze_executed');
