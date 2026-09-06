@@ -925,20 +925,19 @@ export default function Home() {
     setImagePreviews((prev) => prev.filter((_, i) => i !== index));
   };
 
-  const clearAnalyzeResultQuery = () => {
+  /** 分析成功パス（/success）からトップへ戻す（スクロール位置は維持） */
+  const clearAnalyzeSuccessPath = () => {
     try {
       if (typeof window === 'undefined') return;
-      const params = new URLSearchParams(window.location.search);
-      if (!params.has('result')) return;
-      // App Router 経由でクエリを消す（スクロール位置は維持）
-      router.replace(window.location.pathname || '/', { scroll: false });
+      if (window.location.pathname !== '/success') return;
+      router.replace('/', { scroll: false });
     } catch (err) {
-      console.warn('[analyze] failed to clear result query', err);
+      console.warn('[analyze] failed to leave /success path', err);
     }
   };
 
   const handleReset = () => {
-    clearAnalyzeResultQuery();
+    clearAnalyzeSuccessPath();
     setInputText('');
     setImages([]);
     setImagePreviews([]);
@@ -1022,8 +1021,8 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
     setChatInput('');
     setChatError(null);
     setChatErrorRetryable(false);
-    // 再分析開始時は成功クエリをクリア（リロードなし）
-    clearAnalyzeResultQuery();
+    // 再分析開始時は成功パスをクリア（リロードなし）
+    clearAnalyzeSuccessPath();
 
     const propertyId = buildPropertyId(inputText);
     setCurrentPropertyId(propertyId);
@@ -1110,8 +1109,8 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
       setAnalysisCount(newCount);
       writeAnalysisCount(newCount);
       console.log('分析成功: URLを更新します', newCount);
-      // App Router 経由で URL を更新（Vercel Web Analytics のページ集計に反映）
-      router.replace('/?result=success', { scroll: false });
+      // パスベースで URL を更新（Vercel Web Analytics の「ページ」集計用）
+      router.replace('/success', { scroll: false });
 
       try {
         track('analyze_executed');
