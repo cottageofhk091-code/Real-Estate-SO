@@ -2,7 +2,9 @@
 
 import { useState, useEffect, useRef, type CSSProperties, type FormEvent, type ChangeEvent } from 'react';
 import { useRouter } from 'next/navigation';
+import Link from 'next/link';
 import { track } from '@vercel/analytics';
+import { sendGAEvent } from '@next/third-parties/google';
 import { SubscriptionManageButton } from '@/components/SubscriptionManageButton';
 import {
   PRICE_MONTHLY_FIRST_YEN,
@@ -1109,6 +1111,16 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
       console.log('分析成功: URLを更新します', newCount);
       // パスベースで URL を更新（Vercel Web Analytics の「ページ」集計用）
       router.push('/success', { scroll: false });
+
+      try {
+        sendGAEvent('event', 'analyze_executed', {
+          analysis_count: newCount,
+          property_type: propertyType,
+          household_type: householdType,
+        });
+      } catch (gaErr) {
+        console.warn('[analyze] GA4 event failed', gaErr);
+      }
 
       try {
         track('analyze_executed');
@@ -2566,9 +2578,9 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
             特定商取引法に基づく表記
           </button>
           <span style={{ color: COLORS.elevated }}>|</span>
-          <button className="footer-link" onClick={() => setActiveModal('privacy')}>
+          <Link href="/privacy" className="footer-link" style={{ textDecoration: 'none' }}>
             プライバシーポリシー
-          </button>
+          </Link>
           <span style={{ color: COLORS.elevated }}>|</span>
           <button
             className="footer-link"
@@ -2792,22 +2804,26 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
                   {[
                     {
                       t: '1. 取得する情報および利用目的',
-                      b: '当サービスでは、以下の情報を取得・利用します。\n・AI解析および回答生成のため：入力された物件概要テキスト、画像データ\n・決済処理のため：メールアドレス、決済識別情報\n・サービス改善・不正防止のため：アクセスログ、IPアドレス、クッキー（Cookie）情報',
+                      b: '当サービスでは、以下の情報を取得・利用します。\n・AI解析および回答生成のため：入力された物件概要テキスト、画像データ\n・決済処理のため：メールアドレス、決済識別情報\n・サービス改善・不正防止・利用状況の把握のため：アクセスログ、IPアドレス、Cookie（クッキー）情報、分析ツールにより収集される利用データ',
                     },
                     {
-                      t: '2. 外部APIへのデータ送信について',
+                      t: '2. Google アナリティクス（GA4）の利用について',
+                      b: '当サービスでは、利用状況の把握およびサービス改善のため、Google LLC が提供する Google アナリティクス 4（測定ID: G-L9TT3ZXD83）を利用しています。\nGoogle アナリティクスは Cookie 等を用いて、ページ閲覧数や分析実行などの利用イベントを収集します。収集データは個人を特定しない形で統計的に処理されます。',
+                    },
+                    {
+                      t: '3. 外部APIへのデータ送信について',
                       b: '物件の高度な解析を行うため、Google LLC等の提供する外部AIサービス（API）を利用しています。送信されるデータは解析に必要な物件情報等であり、お客様の氏名やクレジットカード情報等の個人を特定する情報は含まれません。',
                     },
                     {
-                      t: '3. 決済処理における第三者提供（Stripe社への提供）',
+                      t: '4. 決済処理における第三者提供（Stripe社への提供）',
                       b: '当サービスでは、クレジットカード決済処理のために決済代行会社「Stripe Payments Japan合同会社」およびその関連会社（米国等）の決済システムを利用しています。\n決済手続きの際、お客様のクレジットカード情報・メールアドレス等はStripe社のサーバーに直接送信・保護され、当サービスのサーバーにはクレジットカード情報は一切保持されません。',
                     },
                     {
-                      t: '4. 第三者提供の制限',
-                      b: '前項の決済代行業者への委託および法令に基づく場合を除き、取得した個人情報をユーザーの同意なく第三者に提供・開示することはありません。',
+                      t: '5. 第三者提供の制限',
+                      b: '前項の決済代行業者への委託、分析ツール提供者への統計データの提供、および法令に基づく場合を除き、取得した個人情報をユーザーの同意なく第三者に提供・開示することはありません。',
                     },
                     {
-                      t: '5. お問い合わせ窓口',
+                      t: '6. お問い合わせ窓口',
                       b: '個人情報の取り扱いに関するお問い合わせは、サイト内のお問い合わせフォーム、または support@cloudflowriver.com よりご連絡ください。',
                     },
                   ].map((item) => (

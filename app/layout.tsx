@@ -2,6 +2,7 @@
 import './globals.css';
 import type { Metadata } from 'next';
 import { Analytics } from '@vercel/analytics/next';
+import { GoogleAnalytics } from '@next/third-parties/google';
 
 export const metadata: Metadata = {
   title: '不動産AIセカンドオピニオン',
@@ -25,6 +26,7 @@ export default function RootLayout({
       <body>
         {children}
         <Analytics />
+        <GoogleAnalytics gaId="G-L9TT3ZXD83" />
       </body>
     </html>
   );
