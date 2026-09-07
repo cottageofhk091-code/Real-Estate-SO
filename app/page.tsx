@@ -1021,8 +1021,6 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
     setChatInput('');
     setChatError(null);
     setChatErrorRetryable(false);
-    // 分析開始時に確実にURLを一旦リセット（連続分析でも /success の PV が毎回発火するようにする）
-    router.replace('/', { scroll: false });
 
     const propertyId = buildPropertyId(inputText);
     setCurrentPropertyId(propertyId);
@@ -1110,7 +1108,7 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
       writeAnalysisCount(newCount);
       console.log('分析成功: URLを更新します', newCount);
       // パスベースで URL を更新（Vercel Web Analytics の「ページ」集計用）
-      router.replace('/success', { scroll: false });
+      router.push('/success', { scroll: false });
 
       try {
         track('analyze_executed');
