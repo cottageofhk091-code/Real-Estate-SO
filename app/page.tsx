@@ -1,10 +1,8 @@
 'use client';
 
 import { useState, useEffect, useRef, type CSSProperties, type FormEvent, type ChangeEvent } from 'react';
-import { useRouter } from 'next/navigation';
 import Link from 'next/link';
-import { track } from '@vercel/analytics';
-import { sendGAEvent } from '@next/third-parties/google';
+import { trackAnalyzeExecuted } from '@/lib/ga';
 import { SubscriptionManageButton } from '@/components/SubscriptionManageButton';
 import {
   PRICE_MONTHLY_FIRST_YEN,
@@ -354,7 +352,6 @@ function ApiErrorPanel({
 }
 
 export default function Home() {
-  const router = useRouter();
   const [inputText, setInputText] = useState('');
   const [images, setImages] = useState<{ inlineData: { mimeType: string; data: string } }[]>([]);
   const [imagePreviews, setImagePreviews] = useState<string[]>([]);
@@ -927,19 +924,7 @@ export default function Home() {
     setImagePreviews((prev) => prev.filter((_, i) => i !== index));
   };
 
-  /** 分析成功パス（/success）からトップへ戻す（スクロール位置は維持） */
-  const clearAnalyzeSuccessPath = () => {
-    try {
-      if (typeof window === 'undefined') return;
-      if (window.location.pathname !== '/success') return;
-      router.replace('/', { scroll: false });
-    } catch (err) {
-      console.warn('[analyze] failed to leave /success path', err);
-    }
-  };
-
   const handleReset = () => {
-    clearAnalyzeSuccessPath();
     setInputText('');
     setImages([]);
     setImagePreviews([]);
@@ -1104,28 +1089,14 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
       setResult(data);
 
       // 分析成功回数を加算・永続化（基本分析の無料無制限とは独立。Paywall は Pro 解放時のみ）
-      // ※ track() より前に実行（Analytics 例外で URL/カウント更新がスキップされないようにする）
       const newCount = readAnalysisCount() + 1;
       setAnalysisCount(newCount);
       writeAnalysisCount(newCount);
-      console.log('分析成功: URLを更新します', newCount);
-      // パスベースで URL を更新（Vercel Web Analytics の「ページ」集計用）
-      router.push('/success', { scroll: false });
 
       try {
-        sendGAEvent('event', 'analyze_executed', {
-          analysis_count: newCount,
-          property_type: propertyType,
-          household_type: householdType,
-        });
+        trackAnalyzeExecuted();
       } catch (gaErr) {
         console.warn('[analyze] GA4 event failed', gaErr);
-      }
-
-      try {
-        track('analyze_executed');
-      } catch (trackErr) {
-        console.warn('[analyze] track failed', trackErr);
       }
 
       const entitledForHistory =

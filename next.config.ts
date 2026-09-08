@@ -6,15 +6,6 @@ const nextConfig: NextConfig = {
   outputFileTracingExcludes: {
     "*": ["./data/**", "data/**"],
   },
-  // /success はトップと同じ UI を出しつつ、Analytics では別ページとして集計
-  async rewrites() {
-    return [
-      {
-        source: "/success",
-        destination: "/",
-      },
-    ];
-  },
 };
 
 export default withSentryConfig(nextConfig, {
