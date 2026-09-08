@@ -1,17 +1,13 @@
 import type { NextRequest } from 'next/server';
 
 const GA4_MEASUREMENT_ID = 'G-WVXB09MGP7';
-const GA4_COLLECT_URL = 'https://www.google-analytics.com/mp/collect';
 
 function fallbackClientId(): string {
   return `server.${Date.now()}.${Math.random().toString(36).substring(2, 9)}`;
 }
 
-/**
- * Cookie の `_ga` から GA4 client_id を取る。
- * 無ければ `server.<timestamp>.<random>` を返す。
- */
-function resolveClientId(req: NextRequest): string {
+/** Cookie の `_ga` から GA4 client_id を取る。無ければサーバー生成 ID。 */
+export function clientIdFromRequest(req: NextRequest): string {
   const raw = req.cookies.get('_ga')?.value;
   if (!raw) return fallbackClientId();
 
@@ -22,57 +18,75 @@ function resolveClientId(req: NextRequest): string {
   return raw.trim() || fallbackClientId();
 }
 
-/**
- * ブラウザの gtag.js が遮断されても、分析成功イベントを GA4 に記録する。
- * 失敗しても分析レスポンスは止めない。
- */
-export async function sendAnalyzeExecutedToGa4(
-  req: NextRequest,
-  params?: { propertyType?: string; householdType?: string }
+function asClientId(value: unknown): string {
+  if (typeof value === 'string' && value.trim()) return value.trim();
+  if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+  return fallbackClientId();
+}
+
+export async function sendGA4Event(
+  eventName: string,
+  params: Record<string, unknown> = {}
 ): Promise<void> {
   const apiSecret = process.env.GA4_API_SECRET;
+  const measurementId = GA4_MEASUREMENT_ID;
+
   if (!apiSecret) {
-    console.warn('[ga4-mp] GA4_API_SECRET is not set; skipped analyze_executed');
+    console.warn('[GA4 MP] GA4_API_SECRET is missing. Skipping event.');
     return;
   }
 
-  const clientId =
-    req.cookies.get('_ga')?.value ||
-    `server.${Date.now()}.${Math.random().toString(36).substring(2, 9)}`;
+  const clientId = asClientId(params.clientId);
+  if (typeof clientId !== 'string' || !clientId) {
+    console.error('[GA4 MP] client_id is not a string. Skipping event.', { clientId });
+    return;
+  }
 
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 4000);
+  const { clientId: _omitClientId, ...eventParams } = params;
+  const payload = {
+    client_id: clientId,
+    events: [
+      {
+        name: eventName,
+        params: {
+          event_category: 'analysis',
+          ...eventParams,
+          engagement_time_msec: 100,
+        },
+      },
+    ],
+  };
 
+  console.log('[GA4 MP] client_id type:', typeof payload.client_id, 'value:', payload.client_id);
+
+  // 1. Debug endpoint (ログでエラーを確認するため)
   try {
-    const res = await fetch(
-      `${GA4_COLLECT_URL}?measurement_id=${GA4_MEASUREMENT_ID}&api_secret=${encodeURIComponent(apiSecret)}`,
+    const debugRes = await fetch(
+      `https://www.google-analytics.com/debug/mp/collect?measurement_id=${measurementId}&api_secret=${apiSecret}`,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          client_id: resolveClientId(req) || clientId,
-          events: [
-            {
-              name: 'analyze_executed',
-              params: {
-                event_category: 'analysis',
-                engagement_time_msec: '100',
-                ...(params?.propertyType ? { property_type: params.propertyType } : {}),
-                ...(params?.householdType ? { household_type: params.householdType } : {}),
-              },
-            },
-          ],
-        }),
-        signal: controller.signal,
+        body: JSON.stringify(payload),
       }
     );
-
-    if (!res.ok) {
-      console.warn('[ga4-mp] collect failed', res.status);
-    }
+    const debugData = await debugRes.json();
+    console.log('[GA4 MP Debug Result]:', JSON.stringify(debugData));
   } catch (err) {
-    console.warn('[ga4-mp] collect error', err);
-  } finally {
-    clearTimeout(timeout);
+    console.error('[GA4 MP Debug Error]:', err);
+  }
+
+  // 2. 本番送信
+  try {
+    const res = await fetch(
+      `https://www.google-analytics.com/mp/collect?measurement_id=${measurementId}&api_secret=${apiSecret}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }
+    );
+    console.log('[GA4 MP Sent Status]:', res.status);
+  } catch (err) {
+    console.error('[GA4 MP Send Error]:', err);
   }
 }

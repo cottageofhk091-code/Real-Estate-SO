@@ -15,7 +15,7 @@ import {
   getGeminiApiKeyDiagnostics,
   hasGeminiApiKey,
 } from '@/lib/gemini';
-import { sendAnalyzeExecutedToGa4 } from '@/lib/ga4-mp';
+import { clientIdFromRequest, sendGA4Event } from '@/lib/ga4-mp';
 import { emitOpsEventFireAndForget } from '@/lib/ops-events';
 import { installVercelFsGuard, isFilesystemError } from '@/lib/vercel-fs-guard';
 
@@ -397,9 +397,10 @@ ${text || 'なし'}
     }
 
     if (typeof parsedData.score === 'number') {
-      await sendAnalyzeExecutedToGa4(req, {
-        propertyType: typeof propertyType === 'string' ? propertyType : undefined,
-        householdType: typeof householdType === 'string' ? householdType : undefined,
+      await sendGA4Event('analyze_executed', {
+        clientId: clientIdFromRequest(req),
+        ...(typeof propertyType === 'string' ? { property_type: propertyType } : {}),
+        ...(typeof householdType === 'string' ? { household_type: householdType } : {}),
       });
     }
 
