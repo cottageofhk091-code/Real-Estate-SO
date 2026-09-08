@@ -15,6 +15,7 @@ import {
   getGeminiApiKeyDiagnostics,
   hasGeminiApiKey,
 } from '@/lib/gemini';
+import { sendAnalyzeExecutedToGa4 } from '@/lib/ga4-mp';
 import { emitOpsEventFireAndForget } from '@/lib/ops-events';
 import { installVercelFsGuard, isFilesystemError } from '@/lib/vercel-fs-guard';
 
@@ -393,6 +394,13 @@ ${text || 'なし'}
       }
     } catch (e) {
       console.warn('FS write skipped / compat mapping skipped', e);
+    }
+
+    if (typeof parsedData.score === 'number') {
+      await sendAnalyzeExecutedToGa4(req, {
+        propertyType: typeof propertyType === 'string' ? propertyType : undefined,
+        householdType: typeof householdType === 'string' ? householdType : undefined,
+      });
     }
 
     return NextResponse.json(parsedData);

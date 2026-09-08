@@ -1,0 +1,72 @@
+const GA4_MEASUREMENT_ID = 'G-WVXB09MGP7';
+const GA4_COLLECT_URL = 'https://www.google-analytics.com/mp/collect';
+
+function clientIdFromRequest(req: Request): string {
+  const cookie = req.headers.get('cookie') || '';
+  const match = cookie.match(/(?:^|;\s*)_ga=([^;]+)/);
+  if (match) {
+    try {
+      const value = decodeURIComponent(match[1]);
+      const parts = value.split('.');
+      if (parts.length >= 4) {
+        return `${parts[parts.length - 2]}.${parts[parts.length - 1]}`;
+      }
+      if (value) return value;
+    } catch {
+      // fall through
+    }
+  }
+  return crypto.randomUUID();
+}
+
+/**
+ * ブラウザの gtag.js が遮断されても、分析成功イベントを GA4 に記録する。
+ * 失敗しても分析レスポンスは止めない。
+ */
+export async function sendAnalyzeExecutedToGa4(
+  req: Request,
+  params?: { propertyType?: string; householdType?: string }
+): Promise<void> {
+  const apiSecret = process.env.GA4_API_SECRET;
+  if (!apiSecret) {
+    console.warn('[ga4-mp] GA4_API_SECRET is not set; skipped analyze_executed');
+    return;
+  }
+
+  const url = new URL(GA4_COLLECT_URL);
+  url.searchParams.set('measurement_id', GA4_MEASUREMENT_ID);
+  url.searchParams.set('api_secret', apiSecret);
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 4000);
+
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        client_id: clientIdFromRequest(req),
+        events: [
+          {
+            name: 'analyze_executed',
+            params: {
+              event_category: 'analysis',
+              engagement_time_msec: 100,
+              ...(params?.propertyType ? { property_type: params.propertyType } : {}),
+              ...(params?.householdType ? { household_type: params.householdType } : {}),
+            },
+          },
+        ],
+      }),
+      signal: controller.signal,
+    });
+
+    if (!res.ok) {
+      console.warn('[ga4-mp] collect failed', res.status);
+    }
+  } catch (err) {
+    console.warn('[ga4-mp] collect error', err);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
