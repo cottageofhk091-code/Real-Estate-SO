@@ -28,6 +28,8 @@ export async function sendGA4Event(
   eventName: string,
   params: Record<string, unknown> = {}
 ): Promise<void> {
+  console.log('[GA4 MP Start] Executing GA4 event sending...');
+
   const apiSecret = process.env.GA4_API_SECRET;
   const measurementId = GA4_MEASUREMENT_ID;
 

@@ -396,12 +396,15 @@ ${text || 'なし'}
       console.warn('FS write skipped / compat mapping skipped', e);
     }
 
-    if (typeof parsedData.score === 'number') {
+    try {
+      console.log('[analyze API] Sending GA4 event...');
       await sendGA4Event('analyze_executed', {
+        event_category: 'analysis',
+        score: typeof parsedData.score === 'number' ? parsedData.score : 0,
         clientId: clientIdFromRequest(req),
-        ...(typeof propertyType === 'string' ? { property_type: propertyType } : {}),
-        ...(typeof householdType === 'string' ? { household_type: householdType } : {}),
       });
+    } catch (gaError) {
+      console.error('[analyze API] GA4 Send Error:', gaError);
     }
 
     return NextResponse.json(parsedData);
