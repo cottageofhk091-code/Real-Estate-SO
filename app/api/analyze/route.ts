@@ -1,5 +1,5 @@
 import '@/lib/vercel-fs-guard-init';
-import { NextResponse } from 'next/server';
+import { NextRequest, NextResponse } from 'next/server';
 import {
   USER_ERROR_MESSAGES,
   classifyUpstreamGeminiError,
@@ -106,7 +106,7 @@ function jsonError(
  * - ローカル fs への永続保存は行わない
  * - 例外時も必ず JSON を返し、プロセスをクラッシュさせない
  */
-export async function POST(req: Request) {
+export async function POST(req: NextRequest) {
   try {
     try {
       installVercelFsGuard();

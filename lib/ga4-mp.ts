@@ -1,22 +1,25 @@
+import type { NextRequest } from 'next/server';
+
 const GA4_MEASUREMENT_ID = 'G-WVXB09MGP7';
 const GA4_COLLECT_URL = 'https://www.google-analytics.com/mp/collect';
 
-function clientIdFromRequest(req: Request): string {
-  const cookie = req.headers.get('cookie') || '';
-  const match = cookie.match(/(?:^|;\s*)_ga=([^;]+)/);
-  if (match) {
-    try {
-      const value = decodeURIComponent(match[1]);
-      const parts = value.split('.');
-      if (parts.length >= 4) {
-        return `${parts[parts.length - 2]}.${parts[parts.length - 1]}`;
-      }
-      if (value) return value;
-    } catch {
-      // fall through
-    }
+function fallbackClientId(): string {
+  return `server.${Date.now()}.${Math.random().toString(36).substring(2, 9)}`;
+}
+
+/**
+ * Cookie の `_ga` から GA4 client_id を取る。
+ * 無ければ `server.<timestamp>.<random>` を返す。
+ */
+function resolveClientId(req: NextRequest): string {
+  const raw = req.cookies.get('_ga')?.value;
+  if (!raw) return fallbackClientId();
+
+  const parts = raw.split('.');
+  if (parts.length >= 4 && parts[parts.length - 2] && parts[parts.length - 1]) {
+    return `${parts[parts.length - 2]}.${parts[parts.length - 1]}`;
   }
-  return crypto.randomUUID();
+  return raw.trim() || fallbackClientId();
 }
 
 /**
@@ -24,7 +27,7 @@ function clientIdFromRequest(req: Request): string {
  * 失敗しても分析レスポンスは止めない。
  */
 export async function sendAnalyzeExecutedToGa4(
-  req: Request,
+  req: NextRequest,
   params?: { propertyType?: string; householdType?: string }
 ): Promise<void> {
   const apiSecret = process.env.GA4_API_SECRET;
@@ -33,33 +36,36 @@ export async function sendAnalyzeExecutedToGa4(
     return;
   }
 
-  const url = new URL(GA4_COLLECT_URL);
-  url.searchParams.set('measurement_id', GA4_MEASUREMENT_ID);
-  url.searchParams.set('api_secret', apiSecret);
+  const clientId =
+    req.cookies.get('_ga')?.value ||
+    `server.${Date.now()}.${Math.random().toString(36).substring(2, 9)}`;
 
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 4000);
 
   try {
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        client_id: clientIdFromRequest(req),
-        events: [
-          {
-            name: 'analyze_executed',
-            params: {
-              event_category: 'analysis',
-              engagement_time_msec: 100,
-              ...(params?.propertyType ? { property_type: params.propertyType } : {}),
-              ...(params?.householdType ? { household_type: params.householdType } : {}),
+    const res = await fetch(
+      `${GA4_COLLECT_URL}?measurement_id=${GA4_MEASUREMENT_ID}&api_secret=${encodeURIComponent(apiSecret)}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          client_id: resolveClientId(req) || clientId,
+          events: [
+            {
+              name: 'analyze_executed',
+              params: {
+                event_category: 'analysis',
+                engagement_time_msec: '100',
+                ...(params?.propertyType ? { property_type: params.propertyType } : {}),
+                ...(params?.householdType ? { household_type: params.householdType } : {}),
+              },
             },
-          },
-        ],
-      }),
-      signal: controller.signal,
-    });
+          ],
+        }),
+        signal: controller.signal,
+      }
+    );
 
     if (!res.ok) {
       console.warn('[ga4-mp] collect failed', res.status);
