@@ -17,6 +17,7 @@ import {
 } from '@/lib/gemini';
 import { clientIdFromRequest, sendGA4Event } from '@/lib/ga4-mp';
 import { emitOpsEventFireAndForget } from '@/lib/ops-events';
+import { supabase } from '@/lib/supabase';
 import { installVercelFsGuard, isFilesystemError } from '@/lib/vercel-fs-guard';
 
 try {
@@ -27,6 +28,7 @@ try {
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
+export const maxDuration = 60;
 
 type PropertyType = 'rental' | 'purchase';
 type HouseholdType = 'single' | 'family';
@@ -405,6 +407,24 @@ ${text || 'なし'}
       });
     } catch (gaError) {
       console.error('[analyze API] GA4 Send Error:', gaError);
+    }
+
+    // Supabase 利用ログ（レスポンス遅延を避けるため await しない）
+    if (supabase) {
+      void supabase
+        .from('app_logs')
+        .insert([
+          {
+            app_name: 'realestate',
+            user_type: 'unregistered',
+            action_type: 'analyze_property',
+          },
+        ])
+        .then(({ error }) => {
+          if (error) console.error('Supabase log error:', error);
+        });
+    } else {
+      console.warn('[analyze API] Supabase client is not configured; skipped app_logs');
     }
 
     return NextResponse.json(parsedData);
