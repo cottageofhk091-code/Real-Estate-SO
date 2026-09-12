@@ -9,9 +9,10 @@ export const metadata: Metadata = {
   description: 'プロの建築士・コンサルタント視点で物件をAI査定',
   icons: {
     icon: [
+      { url: '/favicon.ico' },
       { url: '/app-x-logo.png?v=999', type: 'image/png' },
     ],
-    shortcut: '/app-x-logo.png?v=999',
+    shortcut: '/favicon.ico',
     apple: '/app-x-logo.png?v=999',
   },
 };

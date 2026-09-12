@@ -94,6 +94,7 @@ export async function POST(req: Request) {
       membership_status: 'free' as const,
       age_group: ageGroup,
       region,
+      free_pro_credits: 1,
     };
 
     const profileClient = getSupabaseAdminOrAnon();
@@ -133,6 +134,7 @@ export async function POST(req: Request) {
       membership_status: 'free',
       age_group: ageGroup,
       region,
+      free_pro_credits: 1,
       profileSaved,
     });
   } catch (err) {

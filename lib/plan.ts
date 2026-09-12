@@ -48,6 +48,8 @@ export type AppUser = {
   analysisHistory: AnalysisHistoryRecord[];
   /** Stripe Customer ID（月額解約ポータル用） */
   stripeCustomerId: string | null;
+  /** 無料会員の Pro 体験残回数（users_profiles.free_pro_credits） */
+  freeProCredits: number;
 };
 
 export const USER_STORAGE_KEY = 'bukken_ai_user_state_v3';
@@ -171,6 +173,8 @@ export function loginAsAccountUser(params: {
   previous: AppUser;
   /** Supabase Auth の user.id など、外部で確定した ID があれば優先 */
   preferredUserId?: string;
+  /** 登録直後の無料 Pro 体験残など */
+  freeProCredits?: number;
 }): AppUser {
   const email = normalizeAccountEmail(params.email);
   if (!email) {
@@ -194,6 +198,10 @@ export function loginAsAccountUser(params: {
     typeof params.preferredUserId === 'string' && params.preferredUserId.trim()
       ? params.preferredUserId.trim()
       : null;
+  const creditsOverride =
+    typeof params.freeProCredits === 'number' && Number.isFinite(params.freeProCredits)
+      ? Math.max(0, Math.floor(params.freeProCredits))
+      : null;
 
   let next: AppUser;
   if (saved && saved.userId) {
@@ -203,6 +211,7 @@ export function loginAsAccountUser(params: {
       isLoggedIn: true,
       authProvider: params.provider,
       userId: preferred || existingId || saved.userId,
+      freeProCredits: creditsOverride ?? saved.freeProCredits,
     });
   } else {
     const userId = preferred || existingId || createGuestUserId();
@@ -216,6 +225,7 @@ export function loginAsAccountUser(params: {
       purchasedProperties: [],
       analysisHistory: [],
       stripeCustomerId: null,
+      freeProCredits: creditsOverride ?? 0,
     });
   }
 
@@ -290,7 +300,19 @@ export function canAccessProFeatures(params: {
     return true;
   }
 
+  // 無料体験クレジット残があるログイン会員は Pro 表示を許可（利用時に消費）
+  if (user.isLoggedIn && (user.freeProCredits ?? 0) >= 1) {
+    return true;
+  }
+
   return false;
+}
+
+/** 無料体験枠を使い切っており、有料でもない場合 */
+export function isFreeProTrialExhausted(user: AppUser): boolean {
+  if (!user?.isLoggedIn) return false;
+  if (user.plan === 'MONTHLY') return false;
+  return (user.freeProCredits ?? 0) <= 0;
 }
 
 export function addPurchasedPropertyRecord(
@@ -441,6 +463,7 @@ export function readUserState(): AppUser {
         purchasedProperties: purchased,
         analysisHistory: [],
         stripeCustomerId: null,
+        freeProCredits: 0,
       };
       writeUserState(migrated);
       return migrated;
@@ -465,6 +488,7 @@ export function readUserState(): AppUser {
       purchasedProperties: purchased,
       analysisHistory: [],
       stripeCustomerId: null,
+      freeProCredits: 0,
     };
     writeUserState(migrated);
     return migrated;
@@ -499,6 +523,7 @@ export function createFreshUser(): AppUser {
     purchasedProperties: [],
     analysisHistory: [],
     stripeCustomerId: null,
+    freeProCredits: 0,
   };
 }
 
@@ -554,6 +579,10 @@ function normalizeUser(partial: Partial<AppUser>): AppUser {
       typeof partial.stripeCustomerId === 'string' && partial.stripeCustomerId
         ? partial.stripeCustomerId
         : null,
+    freeProCredits:
+      typeof partial.freeProCredits === 'number' && Number.isFinite(partial.freeProCredits)
+        ? Math.max(0, Math.floor(partial.freeProCredits))
+        : 0,
   };
 }
 

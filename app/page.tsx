@@ -36,6 +36,7 @@ import {
   ensureDevDummyPurchases,
   extractLocationOrUrl,
   extractPropertyTitle,
+  isFreeProTrialExhausted,
   loginAsAccountUser,
   logoutToGuestUser,
   mergeServerEntitlements,
@@ -103,7 +104,17 @@ function writeAnalysisCount(count: number): void {
   }
 }
 
-type ModalType = 'terms' | 'privacy' | 'contact' | 'paywall' | 'agreement' | 'tokushoho' | 'auth' | null;
+type ModalType =
+  | 'terms'
+  | 'privacy'
+  | 'contact'
+  | 'paywall'
+  | 'agreement'
+  | 'tokushoho'
+  | 'auth'
+  | 'signupSuccess'
+  | 'trialExhausted'
+  | null;
 type PayPlan = 'ticket' | 'pro';
 type PropertyType = 'rental' | 'purchase';
 type HouseholdType = 'single' | 'family';
@@ -383,6 +394,7 @@ export default function Home() {
     purchasedProperties: [],
     analysisHistory: [],
     stripeCustomerId: null,
+    freeProCredits: 0,
   });
   const [currentPropertyId, setCurrentPropertyId] = useState<string | null>(null);
   const [authEmail, setAuthEmail] = useState('');
@@ -770,16 +782,85 @@ export default function Home() {
     setActiveModal('paywall');
   };
 
+  /** Pro 機能ゲート: 体験枠消費済みなら専用案内、それ以外は Paywall */
+  const openProGate = (plan?: PayPlan) => {
+    if (
+      user.isLoggedIn &&
+      isFreeProTrialExhausted(user) &&
+      !canAccessProFeatures({ user, currentPropertyId })
+    ) {
+      setActiveModal('trialExhausted');
+      return;
+    }
+    openPaywall(plan);
+  };
+
+  /**
+   * 無料 Pro 体験クレジットを消費し、当該物件を単発購入相当で解放する。
+   * すでに有料アクセスがある場合は何もしない。
+   */
+  const consumeFreeProCreditForProperty = async (
+    propertyId: string,
+    sourceText: string,
+    analysis: AnalysisResult,
+    currentUser: AppUser
+  ): Promise<AppUser> => {
+    if (!propertyId || propertyId === 'prop_empty') return currentUser;
+    if (canAccessProFeatures({ user: currentUser, currentPropertyId: propertyId })) {
+      // クレジット残だけで true の場合は消費が必要
+      const paid =
+        currentUser.plan === 'MONTHLY' ||
+        currentUser.purchasedProperties.some((p) => p.propertyId === propertyId);
+      if (paid) return currentUser;
+    }
+    if (!currentUser.isLoggedIn || (currentUser.freeProCredits ?? 0) < 1) {
+      return currentUser;
+    }
+
+    try {
+      await fetch('/api/auth/consume-pro-credit', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId: currentUser.userId }),
+      });
+    } catch (err) {
+      console.warn('[free-pro] consume API failed', err);
+    }
+
+    const unlocked: AppUser = {
+      ...currentUser,
+      freeProCredits: 0,
+      purchasedProperties: addPurchasedPropertyRecord(
+        currentUser.purchasedProperties,
+        {
+          propertyId,
+          title: extractPropertyTitle(sourceText || propertyId),
+          locationOrUrl: extractLocationOrUrl(sourceText || propertyId),
+          purchasedAt: new Date().toISOString(),
+          householdType,
+          propertyType,
+          sourceText,
+          cachedResult: analysis,
+        },
+        { singleOnly: currentUser.plan !== 'MONTHLY' }
+      ),
+    };
+    persistUser(unlocked);
+    return unlocked;
+  };
+
   const completeAuthAndContinue = (
     email: string,
     provider: 'google' | 'email',
-    preferredUserId?: string
+    preferredUserId?: string,
+    options?: { showSignupThanks?: boolean; freeProCredits?: number }
   ) => {
     const next = loginAsAccountUser({
       email,
       provider,
       previous: user,
       preferredUserId,
+      freeProCredits: options?.freeProCredits,
     });
     persistUser(next);
     // 別アカウントの画面状態が残らないよう診断 UI をリセット
@@ -796,6 +877,30 @@ export default function Home() {
     setAuthRegion('');
     setAuthAgreed(false);
     setAuthError(null);
+
+    // 会員登録成功時は感謝モーダルを先に表示
+    if (options?.showSignupThanks) {
+      setActiveModal('signupSuccess');
+      // entitlements 同期はバックグラウンドで実施
+      void (async () => {
+        try {
+          const entRes = await fetch(
+            `/api/entitlements?userId=${encodeURIComponent(next.userId)}`,
+            { cache: 'no-store', headers: { 'Cache-Control': 'no-cache' } }
+          );
+          if (!entRes.ok) return;
+          const ent = await entRes.json();
+          if (ent.userId && ent.userId !== next.userId) return;
+          if (!ent.found) return;
+          const merged = mergeServerEntitlements(next, ent);
+          persistUser(merged);
+        } catch {
+          // ignore
+        }
+      })();
+      return;
+    }
+
     const intent = authIntent;
     if (intent === 'paywall') {
       if (pendingPayPlan) setSelectedPlan(pendingPayPlan);
@@ -826,6 +931,19 @@ export default function Home() {
         // ignore
       }
     })();
+  };
+
+  /** 登録完了モーダルの「サービスを利用する」 */
+  const finishSignupSuccess = () => {
+    const intent = authIntent;
+    if (intent === 'paywall') {
+      if (pendingPayPlan) setSelectedPlan(pendingPayPlan);
+      setPendingPayPlan(null);
+      setActiveModal('paywall');
+      return;
+    }
+    setPendingPayPlan(null);
+    setActiveModal(null);
   };
 
   const handleLogout = () => {
@@ -911,6 +1029,7 @@ export default function Home() {
         userId?: string;
         email?: string;
         ok?: boolean;
+        free_pro_credits?: number;
       };
 
       if (!res.ok || !data.userId) {
@@ -919,7 +1038,20 @@ export default function Home() {
         return;
       }
 
-      completeAuthAndContinue(data.email || email, 'email', data.userId);
+      const credits =
+        typeof data.free_pro_credits === 'number' ? data.free_pro_credits : authMode === 'signup' ? 1 : 0;
+
+      if (authMode === 'signup') {
+        completeAuthAndContinue(data.email || email, 'email', data.userId, {
+          showSignupThanks: true,
+          freeProCredits: credits,
+        });
+        return;
+      }
+
+      completeAuthAndContinue(data.email || email, 'email', data.userId, {
+        freeProCredits: credits,
+      });
     } catch {
       setAuthError(
         authMode === 'signup'
@@ -1191,9 +1323,20 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
         console.warn('[analyze] GA4 event failed', gaErr);
       }
 
+      // 無料会員の Pro 体験クレジットがあれば、この物件の Pro を解放して消費
+      let userAfterTrial = user;
+      if (user.isLoggedIn && (user.freeProCredits ?? 0) >= 1) {
+        userAfterTrial = await consumeFreeProCreditForProperty(
+          propertyId,
+          inputText,
+          data,
+          user
+        );
+      }
+
       const entitledForHistory =
-        user.plan === 'MONTHLY' ||
-        user.purchasedProperties.some((p) => p.propertyId === propertyId);
+        userAfterTrial.plan === 'MONTHLY' ||
+        userAfterTrial.purchasedProperties.some((p) => p.propertyId === propertyId);
       if (entitledForHistory) {
         void persistAnalysisHistory({
           propertyId,
@@ -1201,7 +1344,7 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
           householdType,
           propertyType,
           cachedResult: data,
-          currentUser: user,
+          currentUser: userAfterTrial,
         });
       }
     } catch (err: unknown) {
@@ -1233,7 +1376,7 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
 
   const sendChatMessage = async (message: string, historyBeforeSend: ChatMessage[]) => {
     if (!result || isProContentLocked) {
-      openPaywall();
+      openProGate();
       return;
     }
 
@@ -1359,7 +1502,7 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
   const handleChatSubmit = async (e: FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     if (!result || isProContentLocked) {
-      openPaywall();
+      openProGate();
       return;
     }
 
@@ -1560,11 +1703,6 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
     currentPropertyId,
   });
 
-  const planStatusLabel =
-    user.plan === 'MONTHLY'
-      ? `user.plan=MONTHLY / purchased=${user.purchasedProperties.length}`
-      : `user.plan=FREE / purchased=${user.purchasedProperties.length}`;
-
   const proFeatures = [
     ...PRO_FEATURES_BASE,
     PRO_FEATURE3_BY_TYPE[propertyType],
@@ -1715,11 +1853,18 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
         >
           <span style={{ fontSize: '28px' }}>🔒</span>
           <p style={{ margin: 0, fontSize: '16px', fontWeight: 800, color: COLORS.text }}>
-            Pro機能で表示
+            {user.isLoggedIn && isFreeProTrialExhausted(user)
+              ? 'Proプランの無料体験枠（1回）を消費しました'
+              : 'Pro機能で表示'}
           </p>
+          {user.isLoggedIn && isFreeProTrialExhausted(user) && (
+            <p style={{ margin: 0, fontSize: '13px', color: COLORS.textMuted, maxWidth: '320px', lineHeight: 1.6 }}>
+              引き続きご利用いただくにはProプランへアップグレードしてください。
+            </p>
+          )}
           <button
             type="button"
-            onClick={() => openPaywall()}
+            onClick={() => openProGate()}
             style={{
               background: 'linear-gradient(to right, #4f46e5, #2563eb)',
               color: '#ffffff',
@@ -1732,7 +1877,9 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
               boxShadow: '0 8px 20px rgba(37, 99, 235, 0.25)',
             }}
           >
-            単発{formatYen(PRICE_SINGLE_YEN)} / 月額で解放
+            {user.isLoggedIn && isFreeProTrialExhausted(user)
+              ? 'Proプランへアップグレード'
+              : `単発${formatYen(PRICE_SINGLE_YEN)} / 月額で解放`}
           </button>
         </div>
       )}
@@ -1891,7 +2038,14 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
       <header style={{ backgroundColor: 'rgba(255, 255, 255, 0.9)', backdropFilter: 'blur(12px)', borderBottom: `1px solid ${COLORS.border}`, padding: '16px 24px', position: 'sticky', top: 0, zIndex: 50 }}>
         <div style={{ maxWidth: '1000px', margin: '0 auto', display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '12px', flexWrap: 'wrap' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-            <span style={{ fontSize: '24px' }}>🏠</span>
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img
+              src="/favicon.ico"
+              alt=""
+              width={28}
+              height={28}
+              style={{ display: 'block', borderRadius: '6px', objectFit: 'cover' }}
+            />
             <span style={{ fontSize: '20px', fontWeight: '800', background: 'linear-gradient(to right, #2563eb, #4f46e5)', WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent' }}>
               物件セカンドオピニオン AI
             </span>
@@ -1903,20 +2057,6 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
                 : isCurrentPropertyPurchased
                   ? '単発Pro購入済み（この物件）'
                   : '無料プラン（基本分析・無制限）'}
-            </span>
-            <span
-              style={{
-                fontSize: '11px',
-                fontWeight: 700,
-                color: COLORS.textMuted,
-                backgroundColor: COLORS.cardAlt,
-                padding: '6px 10px',
-                borderRadius: '8px',
-                border: `1px solid ${COLORS.border}`,
-              }}
-              title={`userId=${user.userId}`}
-            >
-              {planStatusLabel}
             </span>
             {user.isLoggedIn ? (
               <>
@@ -2520,10 +2660,19 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
                   }}
                 >
                   <span style={{ fontSize: '28px' }}>🔒</span>
-                  <p style={{ margin: 0, fontSize: '16px', fontWeight: 800, color: COLORS.text }}>Pro機能で表示</p>
+                  <p style={{ margin: 0, fontSize: '16px', fontWeight: 800, color: COLORS.text }}>
+                    {user.isLoggedIn && isFreeProTrialExhausted(user)
+                      ? 'Proプランの無料体験枠（1回）を消費しました'
+                      : 'Pro機能で表示'}
+                  </p>
+                  {user.isLoggedIn && isFreeProTrialExhausted(user) && (
+                    <p style={{ margin: 0, fontSize: '13px', color: COLORS.textMuted, maxWidth: '320px', lineHeight: 1.6 }}>
+                      引き続きご利用いただくにはProプランへアップグレードしてください。
+                    </p>
+                  )}
                   <button
                     type="button"
-                    onClick={() => openPaywall()}
+                    onClick={() => openProGate()}
                     style={{
                       background: 'linear-gradient(to right, #4f46e5, #2563eb)',
                       color: '#ffffff',
@@ -2535,7 +2684,9 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
                       fontSize: '13px',
                     }}
                   >
-                    単発{formatYen(PRICE_SINGLE_YEN)} / 月額で解放
+                    {user.isLoggedIn && isFreeProTrialExhausted(user)
+                      ? 'Proプランへアップグレード'
+                      : `単発${formatYen(PRICE_SINGLE_YEN)} / 月額で解放`}
                   </button>
                 </div>
               )}
@@ -2678,7 +2829,7 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
             }}
           >
             <div style={{ fontSize: '12px', fontWeight: 800, color: '#b45309', marginBottom: '10px' }}>
-              [DEV] ID紐づけテスト（production非表示） — userId={user.userId} / {planStatusLabel}
+              [DEV] ID紐づけテスト（production非表示） — userId={user.userId} / plan={user.plan} / purchased={user.purchasedProperties.length}
               {currentPropertyId ? ` / currentPropertyId=${currentPropertyId}` : ''}
             </div>
             <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px' }}>
@@ -2729,6 +2880,10 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
       {activeModal && (
         <div
           onClick={() => {
+            if (activeModal === 'signupSuccess') {
+              finishSignupSuccess();
+              return;
+            }
             setActiveModal(null);
             setPaywallMessage(null);
           }}
@@ -2737,8 +2892,22 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
           <div
             onClick={(e) => e.stopPropagation()}
             className="modal-animate"
-            style={{ backgroundColor: COLORS.card, border: `1px solid ${COLORS.border}`, borderRadius: '24px', width: '100%', maxWidth: activeModal === 'paywall' || activeModal === 'auth' ? '560px' : '640px', maxHeight: '85vh', display: 'flex', flexDirection: 'column', boxShadow: '0 25px 50px -12px rgba(0, 0, 0, 0.2)' }}
+            style={{
+              backgroundColor: COLORS.card,
+              border: `1px solid ${COLORS.border}`,
+              borderRadius: '24px',
+              width: '100%',
+              maxWidth:
+                activeModal === 'paywall' || activeModal === 'auth' || activeModal === 'signupSuccess'
+                  ? '560px'
+                  : '640px',
+              maxHeight: '85vh',
+              display: 'flex',
+              flexDirection: 'column',
+              boxShadow: '0 25px 50px -12px rgba(0, 0, 0, 0.2)',
+            }}
           >
+            {activeModal !== 'signupSuccess' && activeModal !== 'trialExhausted' && (
             <div style={{ padding: '20px 24px', borderBottom: `1px solid ${COLORS.border}`, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
               <h3 style={{ margin: 0, fontSize: '18px', fontWeight: 'bold', color: COLORS.text, display: 'flex', alignItems: 'center', gap: '8px' }}>
                 {activeModal === 'terms' && '📜 免責事項'}
@@ -2759,8 +2928,171 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
                 ✕
               </button>
             </div>
+            )}
 
             <div className="modal-body-scroll" style={{ padding: '24px', overflowY: 'auto', fontSize: '14px', lineHeight: '1.7', color: COLORS.textMuted }}>
+
+              {activeModal === 'signupSuccess' && (
+                <div style={{ textAlign: 'center', padding: '20px 8px 8px' }}>
+                  <div
+                    aria-hidden="true"
+                    style={{
+                      width: 72,
+                      height: 72,
+                      margin: '0 auto 20px',
+                      borderRadius: '50%',
+                      background: 'linear-gradient(145deg, #d1fae5 0%, #a7f3d0 100%)',
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      boxShadow: '0 10px 24px rgba(16, 185, 129, 0.25)',
+                    }}
+                  >
+                    <svg width="36" height="36" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                      <circle cx="12" cy="12" r="10" stroke="#059669" strokeWidth="2" />
+                      <path
+                        d="M8 12.5l2.5 2.5L16.5 9"
+                        stroke="#059669"
+                        strokeWidth="2.4"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                      />
+                    </svg>
+                  </div>
+                  <div style={{ fontSize: '36px', marginBottom: '8px', lineHeight: 1 }} aria-hidden="true">
+                    🎉
+                  </div>
+                  <h3
+                    style={{
+                      margin: '0 0 10px',
+                      fontSize: '24px',
+                      fontWeight: 800,
+                      color: COLORS.text,
+                      letterSpacing: '-0.02em',
+                    }}
+                  >
+                    ご登録ありがとうございます！
+                  </h3>
+                  <p
+                    style={{
+                      margin: '0 0 18px',
+                      fontSize: '15px',
+                      color: COLORS.textMuted,
+                      lineHeight: 1.7,
+                    }}
+                  >
+                    無料会員登録が完了しました。
+                  </p>
+                  <div
+                    style={{
+                      margin: '0 0 24px',
+                      padding: '16px 14px',
+                      borderRadius: '14px',
+                      background: 'linear-gradient(135deg, #eef2ff 0%, #ecfeff 100%)',
+                      border: '1px solid #c7d2fe',
+                      textAlign: 'left',
+                    }}
+                  >
+                    <p
+                      style={{
+                        margin: 0,
+                        fontSize: '14px',
+                        fontWeight: 700,
+                        color: '#3730a3',
+                        lineHeight: 1.7,
+                      }}
+                    >
+                      🎁 会員登録特典：Proプラン（詳細判定・AIアドバイス機能）が【1回無料】でご利用いただけます！
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={finishSignupSuccess}
+                    style={{
+                      width: '100%',
+                      background: 'linear-gradient(to right, #2563eb, #4f46e5)',
+                      color: '#ffffff',
+                      fontWeight: 800,
+                      padding: '14px 20px',
+                      borderRadius: '12px',
+                      border: 'none',
+                      cursor: 'pointer',
+                      fontSize: '15px',
+                      boxShadow: '0 10px 22px rgba(37, 99, 235, 0.28)',
+                    }}
+                  >
+                    さっそくPro機能を試す
+                  </button>
+                </div>
+              )}
+
+              {activeModal === 'trialExhausted' && (
+                <div style={{ textAlign: 'center', padding: '12px 4px 4px' }}>
+                  <div style={{ fontSize: '40px', marginBottom: '12px' }} aria-hidden="true">
+                    ⏳
+                  </div>
+                  <h3
+                    style={{
+                      margin: '0 0 12px',
+                      fontSize: '20px',
+                      fontWeight: 800,
+                      color: COLORS.text,
+                    }}
+                  >
+                    無料体験枠を使い切りました
+                  </h3>
+                  <p
+                    style={{
+                      margin: '0 0 24px',
+                      fontSize: '14px',
+                      color: COLORS.textMuted,
+                      lineHeight: 1.7,
+                    }}
+                  >
+                    Proプランの無料体験枠（1回）を消費しました。
+                    <br />
+                    引き続きご利用いただくにはProプランへアップグレードしてください。
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setActiveModal('paywall');
+                      setSelectedPlan('pro');
+                    }}
+                    style={{
+                      width: '100%',
+                      background: 'linear-gradient(to right, #2563eb, #4f46e5)',
+                      color: '#ffffff',
+                      fontWeight: 800,
+                      padding: '14px 20px',
+                      borderRadius: '12px',
+                      border: 'none',
+                      cursor: 'pointer',
+                      fontSize: '15px',
+                      marginBottom: '10px',
+                    }}
+                  >
+                    Proプランへアップグレード
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setActiveModal(null)}
+                    style={{
+                      width: '100%',
+                      background: COLORS.cardAlt,
+                      color: COLORS.textMuted,
+                      fontWeight: 700,
+                      padding: '12px 20px',
+                      borderRadius: '12px',
+                      border: `1px solid ${COLORS.border}`,
+                      cursor: 'pointer',
+                      fontSize: '13px',
+                    }}
+                  >
+                    閉じる
+                  </button>
+                </div>
+              )}
 
               {activeModal === 'terms' && (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
@@ -3381,7 +3713,10 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
 
             </div>
 
-            {activeModal !== 'paywall' && activeModal !== 'auth' && (
+            {activeModal !== 'paywall' &&
+              activeModal !== 'auth' &&
+              activeModal !== 'signupSuccess' &&
+              activeModal !== 'trialExhausted' && (
               <div style={{ padding: '16px 24px', borderTop: `1px solid ${COLORS.border}`, textAlign: 'right' }}>
                 <button
                   onClick={() => setActiveModal(null)}

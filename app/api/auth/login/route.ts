@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { supabase } from '@/lib/supabase';
+import { APP_NAME_REALESTATE, getSupabaseAdminOrAnon, supabase } from '@/lib/supabase';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -49,15 +49,30 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: 'ログインに失敗しました。' }, { status: 500 });
     }
 
+    let freeProCredits = 0;
+    const profileClient = getSupabaseAdminOrAnon();
+    if (profileClient) {
+      const { data: profile } = await profileClient
+        .from('users_profiles')
+        .select('free_pro_credits')
+        .eq('user_id', userId)
+        .eq('app_name', APP_NAME_REALESTATE)
+        .maybeSingle();
+      if (profile && typeof profile.free_pro_credits === 'number') {
+        freeProCredits = Math.max(0, Math.floor(profile.free_pro_credits));
+      }
+    }
+
     return NextResponse.json({
       ok: true,
       userId,
       email: data.user.email || email,
+      free_pro_credits: freeProCredits,
     });
   } catch (err) {
     console.error('[auth/login] unexpected:', err);
     return NextResponse.json(
-      { error: 'ログイン中にエラーが発生しました。もう一度お試しください。' },
+      { error: 'ログイン中に通信エラーが発生しました。もう一度お試しください。' },
       { status: 500 }
     );
   }
