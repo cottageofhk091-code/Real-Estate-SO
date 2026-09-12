@@ -9,9 +9,6 @@ type Body = {
   redirectTo?: unknown;
 };
 
-/**
- * パスワード再設定メールを送信する。
- */
 export async function POST(req: Request) {
   try {
     if (!supabase) {
@@ -33,19 +30,18 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: '有効なメールアドレスを入力してください。' }, { status: 400 });
     }
 
-    // リクエストヘッダーの origin （実際にアクセスしているドメイン）を最優先にする
+    // リクエスト元のドメインを取得
     const origin =
       req.headers.get('origin') ||
       process.env.NEXT_PUBLIC_APP_URL ||
-      (typeof body.redirectTo === 'string' && body.redirectTo.trim()) ||
-      '';
+      'https://real-estate-so.vercel.app';
 
-    const redirectTo = origin
-      ? `${origin.replace(/\/$/, '')}/auth/reset-password`
-      : undefined;
+    // 💡 重要: PKCE認証コードを受け取る callback のパスを指定し、
+    // 次の遷移先（next）として /auth/reset-password を付与します
+    const redirectTo = `${origin.replace(/\/$/, '')}/api/auth/callback?next=/auth/reset-password`;
 
     const { error } = await supabase.auth.resetPasswordForEmail(email, {
-      ...(redirectTo ? { redirectTo } : {}),
+      redirectTo,
     });
 
     if (error) {
@@ -56,7 +52,6 @@ export async function POST(req: Request) {
       );
     }
 
-    // ユーザー列挙を避けるため、成功メッセージは一律
     return NextResponse.json({
       ok: true,
       message: '登録済みの場合、パスワード再設定用のメールを送信しました。',
