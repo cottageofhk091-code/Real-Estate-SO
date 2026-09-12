@@ -1,10 +1,6 @@
 import { NextResponse } from 'next/server';
 import { isAgeGroup, isPrefecture } from '@/lib/survey-options';
-import {
-  APP_NAME_REALESTATE,
-  getSupabaseAdminOrAnon,
-  supabase,
-} from '@/lib/supabase';
+import { APP_NAME_REALESTATE, supabase } from '@/lib/supabase';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -17,6 +13,10 @@ type RegisterBody = {
   agreedToTerms?: unknown;
 };
 
+/**
+ * 会員登録の第一段階: Supabase Auth にサインアップし、確認メール（OTP）を送る。
+ * users_profiles は OTP 検証後に保存する。
+ */
 export async function POST(req: Request) {
   try {
     if (!supabase) {
@@ -67,6 +67,8 @@ export async function POST(req: Request) {
       options: {
         data: {
           app_name: APP_NAME_REALESTATE,
+          age_group: ageGroup,
+          region,
           // 氏名・住所・電話は保存しない
         },
       },
@@ -80,62 +82,24 @@ export async function POST(req: Request) {
       );
     }
 
-    const userId = signUpData.user?.id;
-    if (!userId) {
+    // すでに登録済みで未確認の場合など、identities が空のことがある
+    if (signUpData.user && Array.isArray(signUpData.user.identities) && signUpData.user.identities.length === 0) {
       return NextResponse.json(
-        { error: '会員登録に失敗しました。メール認証の設定をご確認ください。' },
-        { status: 500 }
+        {
+          error:
+            'このメールアドレスは既に登録されているか、確認待ちです。ログインするか、届いている確認メールをご確認ください。',
+        },
+        { status: 400 }
       );
-    }
-
-    const profileRow = {
-      user_id: userId,
-      app_name: APP_NAME_REALESTATE,
-      membership_status: 'free' as const,
-      age_group: ageGroup,
-      region,
-      free_pro_credits: 1,
-    };
-
-    const profileClient = getSupabaseAdminOrAnon();
-    if (!profileClient) {
-      return NextResponse.json(
-        { error: 'プロフィール保存の準備ができていません。' },
-        { status: 503 }
-      );
-    }
-
-    let profileSaved = true;
-    const { error: insertError } = await profileClient.from('users_profiles').insert([profileRow]);
-    if (insertError) {
-      const { error: upsertError } = await profileClient
-        .from('users_profiles')
-        .upsert([profileRow], { onConflict: 'user_id' });
-      if (upsertError) {
-        console.error('[auth/register] profile error:', insertError.message, upsertError.message);
-        profileSaved = false;
-        return NextResponse.json(
-          {
-            error:
-              'アカウントは作成されましたが、プロフィール保存に失敗しました。サポートまでご連絡ください。',
-            userId,
-            email,
-            profileSaved: false,
-          },
-          { status: 500 }
-        );
-      }
     }
 
     return NextResponse.json({
       ok: true,
-      userId,
+      requiresOtp: true,
       email,
-      membership_status: 'free',
       age_group: ageGroup,
       region,
-      free_pro_credits: 1,
-      profileSaved,
+      message: '確認コードをメールに送信しました。',
     });
   } catch (err) {
     console.error('[auth/register] unexpected:', err);
