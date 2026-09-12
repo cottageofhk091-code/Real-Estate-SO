@@ -169,6 +169,8 @@ export function loginAsAccountUser(params: {
   email: string;
   provider: 'google' | 'email';
   previous: AppUser;
+  /** Supabase Auth の user.id など、外部で確定した ID があれば優先 */
+  preferredUserId?: string;
 }): AppUser {
   const email = normalizeAccountEmail(params.email);
   if (!email) {
@@ -188,6 +190,10 @@ export function loginAsAccountUser(params: {
   const index = readAccountIndex();
   const existingId = index[email];
   const saved = loadAccountSnapshot(email);
+  const preferred =
+    typeof params.preferredUserId === 'string' && params.preferredUserId.trim()
+      ? params.preferredUserId.trim()
+      : null;
 
   let next: AppUser;
   if (saved && saved.userId) {
@@ -196,10 +202,10 @@ export function loginAsAccountUser(params: {
       email,
       isLoggedIn: true,
       authProvider: params.provider,
-      userId: existingId || saved.userId,
+      userId: preferred || existingId || saved.userId,
     });
   } else {
-    const userId = existingId || createGuestUserId();
+    const userId = preferred || existingId || createGuestUserId();
     next = normalizeUser({
       ...createFreshUser(),
       userId,

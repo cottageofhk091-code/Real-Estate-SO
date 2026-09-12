@@ -17,6 +17,12 @@ import {
   type AnalysisHistoryRecord,
 } from '@/lib/analysis-history';
 import {
+  AGE_GROUP_OPTIONS,
+  PREFECTURE_OPTIONS,
+  type AgeGroup,
+  type Prefecture,
+} from '@/lib/survey-options';
+import {
   type AnalysisSnapshot,
   type AppUser,
   type UserPlan,
@@ -380,6 +386,12 @@ export default function Home() {
   });
   const [currentPropertyId, setCurrentPropertyId] = useState<string | null>(null);
   const [authEmail, setAuthEmail] = useState('');
+  const [authPassword, setAuthPassword] = useState('');
+  const [authMode, setAuthMode] = useState<'signup' | 'login'>('signup');
+  const [authAgeGroup, setAuthAgeGroup] = useState<AgeGroup | ''>('');
+  const [authRegion, setAuthRegion] = useState<Prefecture | ''>('');
+  const [authAgreed, setAuthAgreed] = useState(false);
+  const [authError, setAuthError] = useState<string | null>(null);
   const [authSubmitting, setAuthSubmitting] = useState(false);
   const [pendingPayPlan, setPendingPayPlan] = useState<PayPlan | null>(null);
   /** authモーダルの用途: ヘッダーからのログイン or 決済前認証 */
@@ -647,7 +659,13 @@ export default function Home() {
 
   const openAuthModal = (intent: 'login' | 'paywall' = 'login') => {
     setAuthIntent(intent);
+    setAuthMode('signup');
     setAuthEmail('');
+    setAuthPassword('');
+    setAuthAgeGroup('');
+    setAuthRegion('');
+    setAuthAgreed(false);
+    setAuthError(null);
     setAuthSubmitting(false);
     setError(null);
     setActiveModal('auth');
@@ -752,8 +770,17 @@ export default function Home() {
     setActiveModal('paywall');
   };
 
-  const completeAuthAndContinue = (email: string, provider: 'google' | 'email') => {
-    const next = loginAsAccountUser({ email, provider, previous: user });
+  const completeAuthAndContinue = (
+    email: string,
+    provider: 'google' | 'email',
+    preferredUserId?: string
+  ) => {
+    const next = loginAsAccountUser({
+      email,
+      provider,
+      previous: user,
+      preferredUserId,
+    });
     persistUser(next);
     // 別アカウントの画面状態が残らないよう診断 UI をリセット
     setResult(null);
@@ -764,6 +791,11 @@ export default function Home() {
     setError(null);
     setAuthSubmitting(false);
     setAuthEmail('');
+    setAuthPassword('');
+    setAuthAgeGroup('');
+    setAuthRegion('');
+    setAuthAgreed(false);
+    setAuthError(null);
     const intent = authIntent;
     if (intent === 'paywall') {
       if (pendingPayPlan) setSelectedPlan(pendingPayPlan);
@@ -824,23 +856,83 @@ export default function Home() {
     handleLogout();
   };
 
-  const handleAuthEmailSubmit = (e: FormEvent<HTMLFormElement>) => {
+  const handleAuthEmailSubmit = async (e: FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     const email = authEmail.trim();
+    const password = authPassword;
+    setAuthError(null);
+    setError(null);
+
     if (!email || !email.includes('@')) {
-      setError('有効なメールアドレスを入力してください。');
+      setAuthError('有効なメールアドレスを入力してください。');
       return;
     }
+    if (password.length < 8) {
+      setAuthError('パスワードは8文字以上で入力してください。');
+      return;
+    }
+
+    if (authMode === 'signup') {
+      if (!authAgeGroup) {
+        setAuthError('年代を選択してください。');
+        return;
+      }
+      if (!authRegion) {
+        setAuthError('地域（都道府県）を選択してください。');
+        return;
+      }
+      if (!authAgreed) {
+        setAuthError('利用規約とプライバシーポリシーへの同意が必要です。');
+        return;
+      }
+    }
+
     setAuthSubmitting(true);
-    setError(null);
-    // デモ: メール認証完了としてログイン状態にする
-    setTimeout(() => {
-      completeAuthAndContinue(email, 'email');
-    }, 500);
+    try {
+      const endpoint = authMode === 'signup' ? '/api/auth/register' : '/api/auth/login';
+      const body =
+        authMode === 'signup'
+          ? {
+              email,
+              password,
+              age_group: authAgeGroup,
+              region: authRegion,
+              agreedToTerms: authAgreed,
+            }
+          : { email, password };
+
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const data = (await res.json().catch(() => ({}))) as {
+        error?: string;
+        userId?: string;
+        email?: string;
+        ok?: boolean;
+      };
+
+      if (!res.ok || !data.userId) {
+        setAuthError(data.error || (authMode === 'signup' ? '会員登録に失敗しました。' : 'ログインに失敗しました。'));
+        setAuthSubmitting(false);
+        return;
+      }
+
+      completeAuthAndContinue(data.email || email, 'email', data.userId);
+    } catch {
+      setAuthError(
+        authMode === 'signup'
+          ? '会員登録中に通信エラーが発生しました。'
+          : 'ログイン中に通信エラーが発生しました。'
+      );
+      setAuthSubmitting(false);
+    }
   };
 
   const handleAuthGoogle = () => {
     setAuthSubmitting(true);
+    setAuthError(null);
     setError(null);
     setTimeout(() => {
       const demoEmail = `user_${user.userId.slice(-6)}@gmail.com`;
@@ -2866,9 +2958,55 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
                   <p style={{ margin: 0, fontSize: '14px', color: COLORS.textMuted, lineHeight: 1.7 }}>
                     {authIntent === 'paywall'
-                      ? '決済の前にアカウント登録（またはログイン）が必要です。完了後、顧客ID（userId）が発行され、決済画面へ進みます。'
-                      : 'アカウント登録またはログインで、マイページ・購入履歴・プラン管理をご利用いただけます。'}
+                      ? '決済の前に無料会員登録（またはログイン）が必要です。氏名・住所・電話番号は取得しません。'
+                      : '無料会員登録でマイページ・購入履歴・プラン管理をご利用いただけます。氏名・住所・電話番号は取得しません。'}
                   </p>
+
+                  <div style={{ display: 'flex', gap: '8px' }}>
+                    <button
+                      type="button"
+                      disabled={authSubmitting}
+                      onClick={() => {
+                        setAuthMode('signup');
+                        setAuthError(null);
+                      }}
+                      style={{
+                        flex: 1,
+                        padding: '10px',
+                        borderRadius: '10px',
+                        border: `1px solid ${authMode === 'signup' ? COLORS.accent : COLORS.border}`,
+                        background: authMode === 'signup' ? '#eef2ff' : '#ffffff',
+                        fontWeight: 800,
+                        fontSize: '13px',
+                        cursor: authSubmitting ? 'not-allowed' : 'pointer',
+                        color: authMode === 'signup' ? COLORS.accentStrong : COLORS.textMuted,
+                      }}
+                    >
+                      無料会員登録
+                    </button>
+                    <button
+                      type="button"
+                      disabled={authSubmitting}
+                      onClick={() => {
+                        setAuthMode('login');
+                        setAuthError(null);
+                      }}
+                      style={{
+                        flex: 1,
+                        padding: '10px',
+                        borderRadius: '10px',
+                        border: `1px solid ${authMode === 'login' ? COLORS.accent : COLORS.border}`,
+                        background: authMode === 'login' ? '#eef2ff' : '#ffffff',
+                        fontWeight: 800,
+                        fontSize: '13px',
+                        cursor: authSubmitting ? 'not-allowed' : 'pointer',
+                        color: authMode === 'login' ? COLORS.accentStrong : COLORS.textMuted,
+                      }}
+                    >
+                      ログイン
+                    </button>
+                  </div>
+
                   <div
                     style={{
                       padding: '12px 14px',
@@ -2881,7 +3019,10 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
                   >
                     {authIntent === 'paywall' && (
                       <>
-                        選択中プラン: {pendingPayPlan === 'ticket' || selectedPlan === 'ticket' ? `単発${formatYen(PRICE_SINGLE_YEN)}` : `PRO月額（初月${formatYen(PRICE_MONTHLY_FIRST_YEN)}）`}
+                        選択中プラン:{' '}
+                        {pendingPayPlan === 'ticket' || selectedPlan === 'ticket'
+                          ? `単発${formatYen(PRICE_SINGLE_YEN)}`
+                          : `PRO月額（初月${formatYen(PRICE_MONTHLY_FIRST_YEN)}）`}
                         <br />
                       </>
                     )}
@@ -2904,7 +3045,7 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
                       color: COLORS.text,
                     }}
                   >
-                    {authSubmitting ? '処理中...' : '🔵 Googleで続ける'}
+                    {authSubmitting ? '処理中...' : '🔵 Googleで続ける（デモ）'}
                   </button>
 
                   <div style={{ display: 'flex', alignItems: 'center', gap: '10px', color: COLORS.textDim, fontSize: '12px' }}>
@@ -2914,16 +3055,130 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
                   </div>
 
                   <form onSubmit={handleAuthEmailSubmit} style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
-                    <input
-                      type="email"
-                      required
-                      value={authEmail}
-                      onChange={(e) => setAuthEmail(e.target.value)}
-                      disabled={authSubmitting}
-                      placeholder="your-email@example.com"
-                      style={inputStyle}
-                      autoComplete="email"
-                    />
+                    <label style={{ display: 'block', fontSize: '12px', color: COLORS.textDim, fontWeight: 700 }}>
+                      メールアドレス
+                      <input
+                        type="email"
+                        required
+                        value={authEmail}
+                        onChange={(e) => setAuthEmail(e.target.value)}
+                        disabled={authSubmitting}
+                        placeholder="your-email@example.com"
+                        style={{ ...inputStyle, marginTop: '6px' }}
+                        autoComplete="email"
+                      />
+                    </label>
+                    <label style={{ display: 'block', fontSize: '12px', color: COLORS.textDim, fontWeight: 700 }}>
+                      パスワード（8文字以上）
+                      <input
+                        type="password"
+                        required
+                        minLength={8}
+                        value={authPassword}
+                        onChange={(e) => setAuthPassword(e.target.value)}
+                        disabled={authSubmitting}
+                        placeholder="********"
+                        style={{ ...inputStyle, marginTop: '6px' }}
+                        autoComplete={authMode === 'signup' ? 'new-password' : 'current-password'}
+                      />
+                    </label>
+
+                    {authMode === 'signup' && (
+                      <>
+                        <label style={{ display: 'block', fontSize: '12px', color: COLORS.textDim, fontWeight: 700 }}>
+                          年代（アンケート）
+                          <select
+                            required
+                            value={authAgeGroup}
+                            onChange={(e) => setAuthAgeGroup(e.target.value as AgeGroup | '')}
+                            disabled={authSubmitting}
+                            style={{ ...inputStyle, marginTop: '6px' }}
+                          >
+                            <option value="">選択してください</option>
+                            {AGE_GROUP_OPTIONS.map((opt) => (
+                              <option key={opt} value={opt}>
+                                {opt}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                        <label style={{ display: 'block', fontSize: '12px', color: COLORS.textDim, fontWeight: 700 }}>
+                          地域（都道府県）
+                          <select
+                            required
+                            value={authRegion}
+                            onChange={(e) => setAuthRegion(e.target.value as Prefecture | '')}
+                            disabled={authSubmitting}
+                            style={{ ...inputStyle, marginTop: '6px' }}
+                          >
+                            <option value="">選択してください</option>
+                            {PREFECTURE_OPTIONS.map((opt) => (
+                              <option key={opt} value={opt}>
+                                {opt}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                        <label
+                          style={{
+                            display: 'flex',
+                            alignItems: 'flex-start',
+                            gap: '10px',
+                            fontSize: '12px',
+                            color: COLORS.textMuted,
+                            lineHeight: 1.6,
+                            cursor: authSubmitting ? 'not-allowed' : 'pointer',
+                          }}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={authAgreed}
+                            onChange={(e) => setAuthAgreed(e.target.checked)}
+                            disabled={authSubmitting}
+                            required
+                            style={{ marginTop: '3px' }}
+                          />
+                          <span>
+                            <button
+                              type="button"
+                              onClick={() => setActiveModal('agreement')}
+                              style={{ background: 'none', border: 'none', padding: 0, color: COLORS.accent, cursor: 'pointer', textDecoration: 'underline', font: 'inherit' }}
+                            >
+                              利用規約
+                            </button>
+                            および
+                            <Link
+                              href="/privacy"
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              style={{ color: COLORS.accent, textDecoration: 'underline' }}
+                            >
+                              プライバシーポリシー
+                            </Link>
+                            に同意します（必須）
+                          </span>
+                        </label>
+                        <p style={{ margin: 0, fontSize: '11px', color: COLORS.textDim }}>
+                          ※ アンケートは年代・都道府県のみです。氏名・詳細住所・電話番号は取得しません。
+                        </p>
+                      </>
+                    )}
+
+                    {authError && (
+                      <div
+                        style={{
+                          padding: '12px',
+                          backgroundColor: '#fef2f2',
+                          border: '1px solid #fecaca',
+                          color: '#b91c1c',
+                          fontSize: '13px',
+                          borderRadius: '8px',
+                        }}
+                      >
+                        ⚠️ {authError}
+                      </div>
+                    )}
+
                     <button
                       type="submit"
                       disabled={authSubmitting}
@@ -2939,14 +3194,20 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
                       }}
                     >
                       {authSubmitting
-                        ? '認証中...'
-                        : authIntent === 'paywall'
-                          ? 'メールで登録して決済へ進む'
-                          : 'メールでログイン / 新規登録'}
+                        ? authMode === 'signup'
+                          ? '登録中...'
+                          : 'ログイン中...'
+                        : authMode === 'signup'
+                          ? authIntent === 'paywall'
+                            ? '無料会員登録して決済へ進む'
+                            : '無料会員登録する'
+                          : authIntent === 'paywall'
+                            ? 'ログインして決済へ進む'
+                            : 'ログインする'}
                     </button>
                   </form>
                   <p style={{ margin: 0, fontSize: '11px', color: COLORS.textDim, textAlign: 'center' }}>
-                    ログイン後に決済・契約管理をご利用いただけます。
+                    登録・ログイン後に決済・契約管理をご利用いただけます。
                   </p>
                 </div>
               )}
