@@ -21,46 +21,48 @@ export default function ResetPasswordPage() {
       return;
     }
 
-    // 1. URLハッシュまたはクエリパラメータからトークンの存在を判定
-    const hash = typeof window !== 'undefined' ? window.location.hash : '';
-    const search = typeof window !== 'undefined' ? window.location.search : '';
-    const hasAuthToken =
-      hash.includes('access_token=') ||
-      hash.includes('type=recovery') ||
-      search.includes('code=');
+    const initAuth = async () => {
+      const searchParams = new URLSearchParams(window.location.search);
+      const code = searchParams.get('code');
+      const isSetup = searchParams.get('setup') === '1';
 
-    // 2. 認証状態のイベント監視
-    const { data: sub } = client.auth.onAuthStateChange((event, session) => {
+      // 1. /api/auth/callback から setup=1 付きで遷移してきた場合、または URL に code が直接ある場合
+      if (isSetup) {
+        setHasSession(true);
+        setReady(true);
+        return;
+      }
+
+      if (code) {
+        const { data: exchangeData, error: exchangeError } =
+          await client.auth.exchangeCodeForSession(code);
+        if (!exchangeError && exchangeData.session) {
+          setHasSession(true);
+          setReady(true);
+          return;
+        }
+      }
+
+      // 2. クッキーからセッションを取得
+      const { data: sessionData } = await client.auth.getSession();
+      if (sessionData.session) {
+        setHasSession(true);
+      }
+      setReady(true);
+    };
+
+    void initAuth();
+
+    // 3. Auth イベントの監視（リカバリーイベント等の検知）
+    const { data: authListener } = client.auth.onAuthStateChange((event, session) => {
       if (session || event === 'PASSWORD_RECOVERY' || event === 'SIGNED_IN') {
         setHasSession(true);
         setReady(true);
       }
     });
 
-    // 3. セッションチェック
-    const init = async () => {
-      const { data } = await client.auth.getSession();
-      if (data.session) {
-        setHasSession(true);
-        setReady(true);
-      } else if (hasAuthToken) {
-        // URLにトークンがある場合はSupabaseがセッションを確立するのを少し待つ
-        setTimeout(async () => {
-          const { data: retryData } = await client.auth.getSession();
-          if (retryData.session) {
-            setHasSession(true);
-          }
-          setReady(true);
-        }, 1200);
-      } else {
-        setReady(true);
-      }
-    };
-
-    void init();
-
     return () => {
-      sub.subscription.unsubscribe();
+      authListener.subscription.unsubscribe();
     };
   }, []);
 

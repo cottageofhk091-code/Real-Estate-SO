@@ -35,13 +35,12 @@ export async function GET(request: NextRequest) {
       }
     );
 
-    // 認証コードをセッション（Cookie）に交換
     const { error } = await supabase.auth.exchangeCodeForSession(code);
     if (!error) {
-      return NextResponse.redirect(`${origin}${next}`);
+      // 💡 認証成功時、?setup=1 を付与してリダイレクト
+      return NextResponse.redirect(`${origin}${next}?setup=1`);
     }
   }
 
-  // エラー時またはコードが存在しない場合
   return NextResponse.redirect(`${origin}/auth/reset-password?error=invalid_link`);
 }
