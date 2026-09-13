@@ -4,16 +4,14 @@ import { NextResponse, type NextRequest } from 'next/server';
 
 export async function GET(request: NextRequest) {
   const { searchParams, origin } = new URL(request.url);
-  const code = searchParams.get('code');
+  const tokenHash = searchParams.get('token_hash');
+  const type = searchParams.get('type') as any;
   const next = searchParams.get('next') ?? '/auth/reset-password';
 
-  if (code) {
-    const cookieStore = await cookies();
-    
-    // 💡 修正点: サーバー側でレスポンスオブジェクトを作成し、
-    // Supabaseのクッキー（Code Verifier等）のセットを確実に行えるようにする
-    const response = NextResponse.redirect(`${origin}${next}?setup=1`);
+  const cookieStore = await cookies();
+  const response = NextResponse.redirect(`${origin}${next}?setup=1`);
 
+  if (tokenHash && type) {
     const supabase = createServerClient(
       process.env.NEXT_PUBLIC_SUPABASE_URL!,
       process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
@@ -25,31 +23,29 @@ export async function GET(request: NextRequest) {
           set(name: string, value: string, options: CookieOptions) {
             try {
               cookieStore.set({ name, value, ...options });
-              // リダイレクトレスポンス側にもクッキーを反映させる
               response.cookies.set({ name, value, ...options });
-            } catch {
-              // 制限エラー回避
-            }
+            } catch {}
           },
           remove(name: string, options: CookieOptions) {
             try {
               cookieStore.set({ name, value: '', ...options, maxAge: 0 });
               response.cookies.set({ name, value: '', ...options, maxAge: 0 });
-            } catch {
-              // 制限エラー回避
-            }
+            } catch {}
           },
         },
       }
     );
 
-    const { error } = await supabase.auth.exchangeCodeForSession(code);
+    // 💡 token_hash を用いてセッションを安全に検証・確立
+    const { error } = await supabase.auth.verifyOtp({
+      token_hash: tokenHash,
+      type: type,
+    });
+
     if (!error) {
-      // クッキーが正しく付与されたレスポンスを返す
       return response;
     }
-    
-    console.error('[auth/callback] exchangeCodeForSession error:', error.message);
+    console.error('[auth/callback] verifyOtp error:', error.message);
   }
 
   return NextResponse.redirect(`${origin}/auth/reset-password?error=invalid_link`);
