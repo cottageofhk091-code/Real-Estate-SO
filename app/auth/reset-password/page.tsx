@@ -22,28 +22,29 @@ export default function ResetPasswordPage() {
     }
 
     const initAuth = async () => {
-      const searchParams = new URLSearchParams(window.location.search);
-      const code = searchParams.get('code');
-      const isSetup = searchParams.get('setup') === '1';
+      // 1. URLハッシュ（#access_token=...）を直接キャッチしてセッションを確立
+      const hash = window.location.hash;
+      if (hash && hash.includes('access_token=')) {
+        const params = new URLSearchParams(hash.substring(1));
+        const accessToken = params.get('access_token');
+        const refreshToken = params.get('refresh_token');
 
-      // 1. /api/auth/callback から setup=1 付きで遷移してきた場合、または URL に code が直接ある場合
-      if (isSetup) {
-        setHasSession(true);
-        setReady(true);
-        return;
-      }
-
-      if (code) {
-        const { data: exchangeData, error: exchangeError } =
-          await client.auth.exchangeCodeForSession(code);
-        if (!exchangeError && exchangeData.session) {
-          setHasSession(true);
-          setReady(true);
-          return;
+        if (accessToken) {
+          const { error: sessionError } = await client.auth.setSession({
+            access_token: accessToken,
+            refresh_token: refreshToken || '',
+          });
+          if (!sessionError) {
+            setHasSession(true);
+            setReady(true);
+            // URLのハッシュを綺麗に消す（任意）
+            window.history.replaceState({}, document.title, window.location.pathname);
+            return;
+          }
         }
       }
 
-      // 2. クッキーからセッションを取得
+      // 2. すでにブラウザにセッションがある場合
       const { data: sessionData } = await client.auth.getSession();
       if (sessionData.session) {
         setHasSession(true);
@@ -53,7 +54,7 @@ export default function ResetPasswordPage() {
 
     void initAuth();
 
-    // 3. Auth イベントの監視（リカバリーイベント等の検知）
+    // 3. Auth イベントの監視
     const { data: authListener } = client.auth.onAuthStateChange((event, session) => {
       if (session || event === 'PASSWORD_RECOVERY' || event === 'SIGNED_IN') {
         setHasSession(true);
