@@ -9,6 +9,11 @@ export async function GET(request: NextRequest) {
 
   if (code) {
     const cookieStore = await cookies();
+    
+    // 💡 修正点: サーバー側でレスポンスオブジェクトを作成し、
+    // Supabaseのクッキー（Code Verifier等）のセットを確実に行えるようにする
+    const response = NextResponse.redirect(`${origin}${next}?setup=1`);
+
     const supabase = createServerClient(
       process.env.NEXT_PUBLIC_SUPABASE_URL!,
       process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
@@ -20,15 +25,18 @@ export async function GET(request: NextRequest) {
           set(name: string, value: string, options: CookieOptions) {
             try {
               cookieStore.set({ name, value, ...options });
+              // リダイレクトレスポンス側にもクッキーを反映させる
+              response.cookies.set({ name, value, ...options });
             } catch {
-              // Route Handler / Server Component の制限エラー回避
+              // 制限エラー回避
             }
           },
           remove(name: string, options: CookieOptions) {
             try {
               cookieStore.set({ name, value: '', ...options, maxAge: 0 });
+              response.cookies.set({ name, value: '', ...options, maxAge: 0 });
             } catch {
-              // Route Handler / Server Component の制限エラー回避
+              // 制限エラー回避
             }
           },
         },
@@ -37,9 +45,11 @@ export async function GET(request: NextRequest) {
 
     const { error } = await supabase.auth.exchangeCodeForSession(code);
     if (!error) {
-      // 💡 認証成功時、?setup=1 を付与してリダイレクト
-      return NextResponse.redirect(`${origin}${next}?setup=1`);
+      // クッキーが正しく付与されたレスポンスを返す
+      return response;
     }
+    
+    console.error('[auth/callback] exchangeCodeForSession error:', error.message);
   }
 
   return NextResponse.redirect(`${origin}/auth/reset-password?error=invalid_link`);
