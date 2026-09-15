@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server';
 
 const APP_NAME = '不動産セカンドオピニオンAI';
-/** Verified domain sender (Resend) */
+/** Verified domain sender (Resend) — From は常に noreply を使用 */
 const DEFAULT_FROM_EMAIL = `${APP_NAME} <noreply@cloudflowriver.com>`;
 /**
  * 一時テスト: Resend → Gmail 直送の疎通確認用。
@@ -18,8 +18,14 @@ function getContactEmail(): string {
 }
 
 function getContactFromEmail(): string {
+  // CONTACT_FROM_EMAIL が support@ 等になっていても、送信元は noreply に固定する。
+  // （From=To=support@ だと Cloudflare Email Routing 側で配送痕跡が出ない要因になり得る）
   const from = process.env.CONTACT_FROM_EMAIL?.trim();
-  if (from) return from;
+  if (from) {
+    const addr = extractEmailAddress(from);
+    if (addr === EXPECTED_FROM_ADDRESS) return from;
+    console.warn('[contact] Ignoring CONTACT_FROM_EMAIL (not noreply):', from);
+  }
   return DEFAULT_FROM_EMAIL;
 }
 
