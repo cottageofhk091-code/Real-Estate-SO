@@ -149,33 +149,39 @@ async function sendContactEmail(params: {
   const emailId = responseJson?.id ?? null;
   let lastEvent: string | null = null;
   if (emailId) {
-    // 受理直後は queued/sent のことがあるため、短く待ってから配信イベントを再取得
-    await new Promise((r) => setTimeout(r, 2500));
-    try {
-      const statusRes = await fetch(`https://api.resend.com/emails/${emailId}`, {
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          'User-Agent': 'bukken-second-opinion-contact/1.0',
-        },
-      });
-      const statusText = await statusRes.text().catch(() => '');
-      let statusJson: ResendEmailResponse | null = null;
+    // queued → sent/delivered/bounced になるまで短くポーリング
+    const maxAttempts = 6;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      await new Promise((r) => setTimeout(r, attempt === 1 ? 2000 : 3000));
       try {
-        statusJson = statusText ? (JSON.parse(statusText) as ResendEmailResponse) : null;
-      } catch {
-        statusJson = null;
+        const statusRes = await fetch(`https://api.resend.com/emails/${emailId}`, {
+          headers: {
+            Authorization: `Bearer ${apiKey}`,
+            'User-Agent': 'bukken-second-opinion-contact/1.0',
+          },
+        });
+        const statusText = await statusRes.text().catch(() => '');
+        let statusJson: ResendEmailResponse | null = null;
+        try {
+          statusJson = statusText ? (JSON.parse(statusText) as ResendEmailResponse) : null;
+        } catch {
+          statusJson = null;
+        }
+        lastEvent = statusJson?.last_event ?? null;
+        console.log('[contact] Resend email status (GET /emails/{id}):', {
+          attempt,
+          status: statusRes.status,
+          id: emailId,
+          from: statusJson?.from ?? null,
+          to: statusJson?.to ?? null,
+          last_event: lastEvent,
+          raw: statusText.slice(0, 2500),
+        });
+        if (lastEvent && lastEvent !== 'queued') break;
+      } catch (statusErr) {
+        console.error('[contact] Failed to fetch Resend email status:', statusErr);
+        break;
       }
-      lastEvent = statusJson?.last_event ?? null;
-      console.log('[contact] Resend email status (GET /emails/{id}):', {
-        status: statusRes.status,
-        id: emailId,
-        from: statusJson?.from ?? null,
-        to: statusJson?.to ?? null,
-        last_event: lastEvent,
-        raw: statusText.slice(0, 2000),
-      });
-    } catch (statusErr) {
-      console.error('[contact] Failed to fetch Resend email status:', statusErr);
     }
   }
 
