@@ -1,16 +1,31 @@
 import { NextResponse } from 'next/server';
 
 const APP_NAME = '不動産セカンドオピニオンAI';
+/** Verified domain sender (Resend) */
+const DEFAULT_FROM_EMAIL = `${APP_NAME} <noreply@cloudflowriver.com>`;
+/**
+ * 一時テスト: Resend → Gmail 直送の疎通確認用。
+ * Vercel の CONTACT_EMAIL より優先して直指定する。
+ * 確認後は null にして support@cloudflowriver.com 運用へ戻すこと。
+ */
+const TEMP_FORCE_CONTACT_EMAIL: string | null = 'cottageofhk091@gmail.com';
 const DEFAULT_CONTACT_EMAIL = 'support@cloudflowriver.com';
+const EXPECTED_FROM_ADDRESS = 'noreply@cloudflowriver.com';
 
 function getContactEmail(): string {
+  if (TEMP_FORCE_CONTACT_EMAIL) return TEMP_FORCE_CONTACT_EMAIL.trim();
   return (process.env.CONTACT_EMAIL || DEFAULT_CONTACT_EMAIL).trim();
 }
 
 function getContactFromEmail(): string {
   const from = process.env.CONTACT_FROM_EMAIL?.trim();
   if (from) return from;
-  return `${APP_NAME} <noreply@cloudflowriver.com>`;
+  return DEFAULT_FROM_EMAIL;
+}
+
+function extractEmailAddress(fromHeader: string): string {
+  const match = fromHeader.match(/<([^>]+)>/);
+  return (match?.[1] || fromHeader).trim().toLowerCase();
 }
 
 function escapeHtml(value: string): string {
@@ -28,11 +43,21 @@ async function sendContactEmail(params: {
   name: string;
   type: string;
   message: string;
-}): Promise<void> {
+}): Promise<{ id: string | null }> {
   const apiKey = process.env.RESEND_API_KEY?.trim();
   if (!apiKey) {
     console.error('[contact] RESEND_API_KEY is not set');
     throw new Error('メール送信の設定エラーです（RESEND_API_KEY）。');
+  }
+
+  const from = getContactFromEmail();
+  const fromAddress = extractEmailAddress(from);
+  if (fromAddress !== EXPECTED_FROM_ADDRESS) {
+    console.warn('[contact] Unexpected From address:', {
+      from,
+      fromAddress,
+      expected: EXPECTED_FROM_ADDRESS,
+    });
   }
 
   const subject = `【${APP_NAME}】お問い合わせ: ${params.type || '一般'}`;
@@ -60,6 +85,22 @@ async function sendContactEmail(params: {
     </div>
   `;
 
+  const payload = {
+    from,
+    to: [params.to],
+    reply_to: params.replyTo,
+    subject,
+    text: textBody,
+    html: htmlBody,
+  };
+
+  console.log('[contact] Resend send request:', {
+    from: payload.from,
+    to: payload.to,
+    reply_to: payload.reply_to,
+    subject: payload.subject,
+  });
+
   const res = await fetch('https://api.resend.com/emails', {
     method: 'POST',
     headers: {
@@ -67,21 +108,42 @@ async function sendContactEmail(params: {
       'Content-Type': 'application/json',
       'User-Agent': 'bukken-second-opinion-contact/1.0',
     },
-    body: JSON.stringify({
-      from: getContactFromEmail(),
-      to: [params.to],
-      reply_to: params.replyTo,
-      subject,
-      text: textBody,
-      html: htmlBody,
-    }),
+    body: JSON.stringify(payload),
+  });
+
+  const responseText = await res.text().catch(() => '');
+  type ResendEmailResponse = {
+    id?: string;
+    error?: unknown;
+    message?: string;
+    name?: string;
+  };
+  let responseJson: ResendEmailResponse | null = null;
+  try {
+    responseJson = responseText ? (JSON.parse(responseText) as ResendEmailResponse) : null;
+  } catch {
+    responseJson = null;
+  }
+
+  console.log('[contact] Resend send response:', {
+    ok: res.ok,
+    status: res.status,
+    id: responseJson?.id ?? null,
+    error: responseJson?.error ?? null,
+    message: responseJson?.message ?? null,
+    name: responseJson?.name ?? null,
+    raw: responseText.slice(0, 2000),
   });
 
   if (!res.ok) {
-    const body = await res.text().catch(() => '');
-    console.error('[contact] Resend email failed:', res.status, body);
+    console.error('[contact] Resend email failed:', {
+      status: res.status,
+      error: responseJson?.error ?? responseText,
+    });
     throw new Error('お問い合わせメールの送信に失敗しました。');
   }
+
+  return { id: responseJson?.id ?? null };
 }
 
 export async function POST(request: Request) {
@@ -106,7 +168,15 @@ export async function POST(request: Request) {
     const inquiryType = type ? String(type).trim() : '';
     const inquiryMessage = String(message).trim();
 
-    await sendContactEmail({
+    console.log('[contact] Resolved addresses:', {
+      from: getContactFromEmail(),
+      to: contactEmail,
+      replyTo: trimmedEmail,
+      envContactEmail: process.env.CONTACT_EMAIL ? '(set)' : '(unset → default)',
+      envContactFromEmail: process.env.CONTACT_FROM_EMAIL ? '(set)' : '(unset → default)',
+    });
+
+    const { id: resendId } = await sendContactEmail({
       to: contactEmail,
       replyTo: trimmedEmail,
       name: displayName,
@@ -114,7 +184,12 @@ export async function POST(request: Request) {
       message: inquiryMessage,
     });
 
-    return NextResponse.json({ success: true, notified: contactEmail });
+    return NextResponse.json({
+      success: true,
+      notified: contactEmail,
+      from: getContactFromEmail(),
+      resendId,
+    });
   } catch (error) {
     console.error('Contact Error:', error);
     const message =
