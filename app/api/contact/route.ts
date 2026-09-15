@@ -41,7 +41,7 @@ async function sendContactEmail(params: {
   name: string;
   type: string;
   message: string;
-}): Promise<{ id: string | null }> {
+}): Promise<{ id: string | null; lastEvent: string | null }> {
   const apiKey = process.env.RESEND_API_KEY?.trim();
   if (!apiKey) {
     console.error('[contact] RESEND_API_KEY is not set');
@@ -92,7 +92,9 @@ async function sendContactEmail(params: {
     html: htmlBody,
   };
 
-  console.log('[contact] Resend send request:', {
+  console.log('[contact] From:', payload.from);
+  console.log('[contact] To:', payload.to);
+  console.log('[contact] Resend API Request (pre-send):', {
     from: payload.from,
     to: payload.to,
     reply_to: payload.reply_to,
@@ -115,6 +117,9 @@ async function sendContactEmail(params: {
     error?: unknown;
     message?: string;
     name?: string;
+    last_event?: string;
+    to?: string[];
+    from?: string;
   };
   let responseJson: ResendEmailResponse | null = null;
   try {
@@ -123,7 +128,7 @@ async function sendContactEmail(params: {
     responseJson = null;
   }
 
-  console.log('[contact] Resend send response:', {
+  console.log('[contact] Resend API Response (post-send):', {
     ok: res.ok,
     status: res.status,
     id: responseJson?.id ?? null,
@@ -141,7 +146,40 @@ async function sendContactEmail(params: {
     throw new Error('お問い合わせメールの送信に失敗しました。');
   }
 
-  return { id: responseJson?.id ?? null };
+  const emailId = responseJson?.id ?? null;
+  let lastEvent: string | null = null;
+  if (emailId) {
+    // 受理直後は queued/sent のことがあるため、短く待ってから配信イベントを再取得
+    await new Promise((r) => setTimeout(r, 2500));
+    try {
+      const statusRes = await fetch(`https://api.resend.com/emails/${emailId}`, {
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          'User-Agent': 'bukken-second-opinion-contact/1.0',
+        },
+      });
+      const statusText = await statusRes.text().catch(() => '');
+      let statusJson: ResendEmailResponse | null = null;
+      try {
+        statusJson = statusText ? (JSON.parse(statusText) as ResendEmailResponse) : null;
+      } catch {
+        statusJson = null;
+      }
+      lastEvent = statusJson?.last_event ?? null;
+      console.log('[contact] Resend email status (GET /emails/{id}):', {
+        status: statusRes.status,
+        id: emailId,
+        from: statusJson?.from ?? null,
+        to: statusJson?.to ?? null,
+        last_event: lastEvent,
+        raw: statusText.slice(0, 2000),
+      });
+    } catch (statusErr) {
+      console.error('[contact] Failed to fetch Resend email status:', statusErr);
+    }
+  }
+
+  return { id: emailId, lastEvent };
 }
 
 export async function POST(request: Request) {
@@ -174,7 +212,7 @@ export async function POST(request: Request) {
       envContactFromEmail: process.env.CONTACT_FROM_EMAIL ? '(set)' : '(unset → default)',
     });
 
-    const { id: resendId } = await sendContactEmail({
+    const { id: resendId, lastEvent } = await sendContactEmail({
       to: contactEmail,
       replyTo: trimmedEmail,
       name: displayName,
@@ -187,6 +225,7 @@ export async function POST(request: Request) {
       notified: contactEmail,
       from: getContactFromEmail(),
       resendId,
+      lastEvent,
     });
   } catch (error) {
     console.error('Contact Error:', error);
