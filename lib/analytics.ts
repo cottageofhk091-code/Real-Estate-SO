@@ -1,7 +1,5 @@
 import { createBrowserSupabase } from '@/lib/supabase-browser';
 
-/** users_profiles / app_logs と同じアプリ識別子（lib/supabase.ts の APP_NAME_REALESTATE） */
-const APP_NAME = 'realestate' as const;
 const TRACKED_KEY = 'has_tracked_visit';
 
 function categorizeSource(utmSource: string | null, referrer: string): string {
@@ -55,7 +53,7 @@ export async function trackVisit(): Promise<void> {
 
   try {
     const { error } = await supabase.from('analytics_visits').insert({
-      app_name: APP_NAME,
+      app_name: 'realestate', // fleama-sold ではなく本アプリ識別子
       source_category: sourceCategory,
       utm_source: utmSource || null,
       referrer: referrer || null,
