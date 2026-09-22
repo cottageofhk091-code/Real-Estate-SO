@@ -3,6 +3,7 @@ import './globals.css';
 import type { Metadata } from 'next';
 import Script from 'next/script';
 import { Analytics } from '@vercel/analytics/next';
+import VisitTracker from './components/VisitTracker';
 
 export const metadata: Metadata = {
   title: '不動産AIセカンドオピニオン',
@@ -38,6 +39,7 @@ export default function RootLayout({
             gtag('config', 'G-WVXB09MGP7');
           `}
         </Script>
+        <VisitTracker />
         {children}
         <Analytics />
       </body>
