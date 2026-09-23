@@ -56,7 +56,8 @@ export async function POST(req: Request) {
       .from('users_profiles')
       .update({ free_pro_credits: 0 })
       .eq('user_id', userId)
-      .eq('app_name', APP_NAME_REALESTATE);
+      .eq('app_name', APP_NAME_REALESTATE)
+      .gt('free_pro_credits', 0);
 
     if (updateError) {
       console.error('[consume-pro-credit] update error:', updateError.message);

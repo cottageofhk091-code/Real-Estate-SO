@@ -43,6 +43,20 @@ import {
   readUserState,
   writeUserState,
 } from '@/lib/plan';
+import { createBrowserSupabase } from '@/lib/supabase-browser';
+import {
+  AUTH_CHANNEL,
+  AUTH_PING_KEY,
+  AUTH_RECOVERY_PING_KEY,
+  SIGNUP_WELCOME_MESSAGE,
+  clearPendingRecovery,
+  clearPendingSignup,
+  hasPendingRecovery,
+  hasPendingSignup,
+  isAuthHelperPath,
+  markPendingRecovery,
+  markPendingSignup,
+} from '@/lib/auth-client';
 
 interface AnalysisResult {
   score: number;
@@ -399,8 +413,13 @@ export default function Home() {
   const [currentPropertyId, setCurrentPropertyId] = useState<string | null>(null);
   const [authEmail, setAuthEmail] = useState('');
   const [authPassword, setAuthPassword] = useState('');
-  const [authMode, setAuthMode] = useState<'signup' | 'login' | 'otp' | 'forgot' | 'forgotSent'>('signup');
+  const [authMode, setAuthMode] = useState<
+    'signup' | 'login' | 'awaitConfirm' | 'forgot' | 'forgotSent' | 'setNewPassword'
+  >('signup');
   const [authOtpCode, setAuthOtpCode] = useState('');
+  const [newPassword, setNewPassword] = useState('');
+  const [newPasswordConfirm, setNewPasswordConfirm] = useState('');
+  const [sessionTrialUnlock, setSessionTrialUnlock] = useState(false);
   const [authAgeGroup, setAuthAgeGroup] = useState<AgeGroup | ''>('');
   const [authRegion, setAuthRegion] = useState<Prefecture | ''>('');
   const [authAgreed, setAuthAgreed] = useState(false);
@@ -438,6 +457,9 @@ export default function Home() {
     message: string;
     historyBeforeSend: ChatMessage[];
   } | null>(null);
+  const userRef = useRef(user);
+  userRef.current = user;
+  const applyingAuthRef = useRef(false);
 
   // LocalStorage からユーザー状態・分析回数を復元
   useEffect(() => {
@@ -448,7 +470,26 @@ export default function Home() {
       next = ensureDevDummyPurchases(next);
     }
     setUser(next);
+    userRef.current = next;
     if (next.email) setPaywallEmail(next.email);
+
+    if (next.isLoggedIn && next.userId) {
+      void (async () => {
+        try {
+          const res = await fetch(
+            `/api/auth/credits?userId=${encodeURIComponent(next.userId)}`,
+            { cache: 'no-store' }
+          );
+          const data = (await res.json().catch(() => ({}))) as { free_pro_credits?: number };
+          if (res.ok && typeof data.free_pro_credits === 'number') {
+            const latest = { ...userRef.current, freeProCredits: Math.max(0, data.free_pro_credits) };
+            persistUser(latest);
+          }
+        } catch {
+          // ignore
+        }
+      })();
+    }
 
     // サーバー entitlements 同期 + Checkout 戻り処理
     void (async () => {
@@ -686,6 +727,7 @@ export default function Home() {
   };
 
   const persistUser = (next: AppUser) => {
+    userRef.current = next;
     setUser(next);
     writeUserState(next);
   };
@@ -789,7 +831,7 @@ export default function Home() {
     if (
       user.isLoggedIn &&
       isFreeProTrialExhausted(user) &&
-      !canAccessProFeatures({ user, currentPropertyId })
+      !canAccessProFeatures({ user, currentPropertyId, sessionTrialUnlock })
     ) {
       setActiveModal('trialExhausted');
       return;
@@ -808,30 +850,35 @@ export default function Home() {
     currentUser: AppUser
   ): Promise<AppUser> => {
     if (!propertyId || propertyId === 'prop_empty') return currentUser;
-    if (canAccessProFeatures({ user: currentUser, currentPropertyId: propertyId })) {
-      // クレジット残だけで true の場合は消費が必要
+    if (canAccessProFeatures({ user: currentUser, currentPropertyId: propertyId, sessionTrialUnlock })) {
       const paid =
         currentUser.plan === 'MONTHLY' ||
-        currentUser.purchasedProperties.some((p) => p.propertyId === propertyId);
+        currentUser.purchasedProperties.some((p) => p.propertyId === propertyId && !p.fromFreeTrial);
       if (paid) return currentUser;
     }
     if (!currentUser.isLoggedIn || (currentUser.freeProCredits ?? 0) < 1) {
       return currentUser;
     }
 
+    let remaining = 0;
     try {
-      await fetch('/api/auth/consume-pro-credit', {
+      const res = await fetch('/api/auth/consume-pro-credit', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ userId: currentUser.userId }),
       });
+      const data = (await res.json().catch(() => ({}))) as { free_pro_credits?: number };
+      if (typeof data.free_pro_credits === 'number') {
+        remaining = Math.max(0, data.free_pro_credits);
+      }
     } catch (err) {
       console.warn('[free-pro] consume API failed', err);
+      return currentUser;
     }
 
     const unlocked: AppUser = {
       ...currentUser,
-      freeProCredits: 0,
+      freeProCredits: remaining,
       purchasedProperties: addPurchasedPropertyRecord(
         currentUser.purchasedProperties,
         {
@@ -843,11 +890,13 @@ export default function Home() {
           propertyType,
           sourceText,
           cachedResult: analysis,
+          fromFreeTrial: true,
         },
         { singleOnly: currentUser.plan !== 'MONTHLY' }
       ),
     };
     persistUser(unlocked);
+    setSessionTrialUnlock(true);
     return unlocked;
   };
 
@@ -860,7 +909,7 @@ export default function Home() {
     const next = loginAsAccountUser({
       email,
       provider,
-      previous: user,
+      previous: userRef.current,
       preferredUserId,
       freeProCredits: options?.freeProCredits,
     });
@@ -951,6 +1000,14 @@ export default function Home() {
   };
 
   const handleLogout = () => {
+    clearPendingSignup();
+    clearPendingRecovery();
+    setSessionTrialUnlock(false);
+    try {
+      void createBrowserSupabase()?.auth.signOut();
+    } catch {
+      // ignore
+    }
     const next = logoutToGuestUser(user);
     persistUser(next);
     clearClientSessionCaches();
@@ -963,6 +1020,107 @@ export default function Home() {
     setActiveModal(null);
     setPaywallMessage(null);
   };
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    if (isAuthHelperPath(window.location.pathname)) return;
+
+    const client = createBrowserSupabase();
+    if (!client) return;
+
+    const openRecovery = () => {
+      setAuthMode('setNewPassword');
+      setAuthError(null);
+      setActiveModal('auth');
+    };
+
+    const applyConfirmedSession = async () => {
+      if (applyingAuthRef.current || userRef.current.isLoggedIn) return;
+      applyingAuthRef.current = true;
+      try {
+        const { data } = await client.auth.getSession();
+        const token = data.session?.access_token;
+        if (!token) return;
+        const res = await fetch('/api/auth/complete', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ access_token: token, grantBonus: hasPendingSignup() }),
+        });
+        const json = (await res.json().catch(() => ({}))) as {
+          userId?: string;
+          email?: string;
+          free_pro_credits?: number;
+        };
+        if (!res.ok || !json.userId) return;
+        completeAuthAndContinue(json.email || userRef.current.email || '', 'email', json.userId, {
+          showSignupThanks: true,
+          freeProCredits: typeof json.free_pro_credits === 'number' ? json.free_pro_credits : 0,
+        });
+        clearPendingSignup();
+      } catch {
+        // ignore
+      } finally {
+        applyingAuthRef.current = false;
+      }
+    };
+
+    const { data: authListener } = client.auth.onAuthStateChange((event) => {
+      if (event === 'PASSWORD_RECOVERY') {
+        openRecovery();
+        return;
+      }
+      if ((event === 'SIGNED_IN' || event === 'USER_UPDATED') && hasPendingSignup()) {
+        void applyConfirmedSession();
+      }
+    });
+
+    const onStorage = (e: StorageEvent) => {
+      if (e.key === AUTH_RECOVERY_PING_KEY && e.newValue) {
+        openRecovery();
+        return;
+      }
+      if (e.key === AUTH_PING_KEY && e.newValue && hasPendingSignup()) {
+        void applyConfirmedSession();
+      }
+    };
+    window.addEventListener('storage', onStorage);
+
+    let channel: BroadcastChannel | null = null;
+    try {
+      channel = new BroadcastChannel(AUTH_CHANNEL);
+      channel.onmessage = (event) => {
+        if (event?.data?.type === 'password-recovery') {
+          openRecovery();
+          return;
+        }
+        if (event?.data?.type === 'signup-confirmed') {
+          void applyConfirmedSession();
+        }
+      };
+    } catch {
+      channel = null;
+    }
+
+    let pollTimer: number | null = null;
+    if (hasPendingSignup()) {
+      pollTimer = window.setInterval(() => {
+        if (userRef.current.isLoggedIn) {
+          if (pollTimer) window.clearInterval(pollTimer);
+          pollTimer = null;
+          return;
+        }
+        void applyConfirmedSession();
+      }, 2500);
+    }
+
+    return () => {
+      authListener.subscription.unsubscribe();
+      window.removeEventListener('storage', onStorage);
+      channel?.close();
+      if (pollTimer) window.clearInterval(pollTimer);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const applyDevLoginState = (loggedIn: boolean) => {
     if (loggedIn) {
@@ -1006,6 +1164,7 @@ export default function Home() {
           setAuthSubmitting(false);
           return;
         }
+        markPendingRecovery(email);
         setAuthMode('forgotSent');
         setAuthSubmitting(false);
       } catch {
@@ -1015,41 +1174,39 @@ export default function Home() {
       return;
     }
 
-    if (authMode === 'otp') {
-      const token = authOtpCode.trim();
-      if (!/^\d{6}$/.test(token)) {
-        setAuthError('メールに記載の6桁の認証コードを入力してください。');
+    if (authMode === 'setNewPassword') {
+      if (newPassword.length < 8) {
+        setAuthError('パスワードは8文字以上で入力してください。');
+        return;
+      }
+      if (newPassword !== newPasswordConfirm) {
+        setAuthError('確認用パスワードが一致しません。');
         return;
       }
       setAuthSubmitting(true);
       try {
-        const res = await fetch('/api/auth/verify-signup', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            email,
-            token,
-            age_group: authAgeGroup,
-            region: authRegion,
-          }),
-        });
-        const data = (await res.json().catch(() => ({}))) as {
-          error?: string;
-          userId?: string;
-          email?: string;
-          free_pro_credits?: number;
-        };
-        if (!res.ok || !data.userId) {
-          setAuthError(data.error || '認証コードの確認に失敗しました。');
+        const client = createBrowserSupabase();
+        if (!client) {
+          setAuthError('認証の準備ができていません。');
           setAuthSubmitting(false);
           return;
         }
-        completeAuthAndContinue(data.email || email, 'email', data.userId, {
-          showSignupThanks: true,
-          freeProCredits: typeof data.free_pro_credits === 'number' ? data.free_pro_credits : 1,
-        });
+        const { error } = await client.auth.updateUser({ password: newPassword });
+        if (error) {
+          setAuthError(error.message || 'パスワードの更新に失敗しました。');
+          setAuthSubmitting(false);
+          return;
+        }
+        clearPendingRecovery();
+        setAuthMode('login');
+        setAuthPassword('');
+        setNewPassword('');
+        setNewPasswordConfirm('');
+        setAuthError(null);
+        setAuthSubmitting(false);
+        setActiveModal(null);
       } catch {
-        setAuthError('認証コードの確認中に通信エラーが発生しました。');
+        setAuthError('パスワード更新中に通信エラーが発生しました。');
         setAuthSubmitting(false);
       }
       return;
@@ -1096,15 +1253,15 @@ export default function Home() {
         const data = (await res.json().catch(() => ({}))) as {
           error?: string;
           ok?: boolean;
-          requiresOtp?: boolean;
+          requiresEmailConfirm?: boolean;
         };
         if (!res.ok) {
           setAuthError(data.error || '会員登録に失敗しました。');
           setAuthSubmitting(false);
           return;
         }
-        setAuthOtpCode('');
-        setAuthMode('otp');
+        markPendingSignup(email);
+        setAuthMode('awaitConfirm');
         setAuthSubmitting(false);
         return;
       }
@@ -1156,14 +1313,14 @@ export default function Home() {
       });
       const data = (await res.json().catch(() => ({}))) as { error?: string };
       if (!res.ok) {
-        setAuthError(data.error || '確認コードの再送に失敗しました。');
+        setAuthError(data.error || '確認メールの再送に失敗しました。');
       } else {
         setAuthError(null);
         setPaywallMessage(null);
       }
       setAuthSubmitting(false);
     } catch {
-      setAuthError('確認コードの再送中に通信エラーが発生しました。');
+      setAuthError('確認メールの再送中に通信エラーが発生しました。');
       setAuthSubmitting(false);
     }
   };
@@ -1255,6 +1412,7 @@ export default function Home() {
   };
 
   const handleReset = () => {
+    setSessionTrialUnlock(false);
     setInputText('');
     setImages([]);
     setImagePreviews([]);
@@ -1330,6 +1488,7 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
       controller.abort();
     }, ANALYZE_TIMEOUT_MS);
 
+    setSessionTrialUnlock(false);
     setLoading(true);
     setError(null);
     setErrorRetryable(false);
@@ -1803,10 +1962,11 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
   const isProUser = user.plan === 'MONTHLY';
   const isCurrentPropertyPurchased =
     !!currentPropertyId &&
-    user.purchasedProperties.some((p) => p.propertyId === currentPropertyId);
+    user.purchasedProperties.some((p) => p.propertyId === currentPropertyId && !p.fromFreeTrial);
   const isProContentLocked = !canAccessProFeatures({
     user,
     currentPropertyId,
+    sessionTrialUnlock,
   });
 
   const proFeatures = [
@@ -2345,10 +2505,10 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
                 物件タイプ
               </label>
               <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
-                <button type="button" disabled={loading} onClick={() => setPropertyType('rental')} style={optionChipStyle(propertyType === 'rental')}>
+                <button type="button" disabled={loading} onClick={() => { setSessionTrialUnlock(false); setPropertyType('rental'); }} style={optionChipStyle(propertyType === 'rental')}>
                   賃貸
                 </button>
-                <button type="button" disabled={loading} onClick={() => setPropertyType('purchase')} style={optionChipStyle(propertyType === 'purchase')}>
+                <button type="button" disabled={loading} onClick={() => { setSessionTrialUnlock(false); setPropertyType('purchase'); }} style={optionChipStyle(propertyType === 'purchase')}>
                   分譲（購入）
                 </button>
               </div>
@@ -2358,10 +2518,10 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
                 世帯タイプ
               </label>
               <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
-                <button type="button" disabled={loading} onClick={() => setHouseholdType('single')} style={optionChipStyle(householdType === 'single')}>
+                <button type="button" disabled={loading} onClick={() => { setSessionTrialUnlock(false); setHouseholdType('single'); }} style={optionChipStyle(householdType === 'single')}>
                   一人暮らし
                 </button>
-                <button type="button" disabled={loading} onClick={() => setHouseholdType('family')} style={optionChipStyle(householdType === 'family')}>
+                <button type="button" disabled={loading} onClick={() => { setSessionTrialUnlock(false); setHouseholdType('family'); }} style={optionChipStyle(householdType === 'family')}>
                   ファミリー（同居あり）
                 </button>
               </div>
@@ -3022,8 +3182,10 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
                 {activeModal === 'privacy' && '🔒 プライバシーポリシー'}
                 {activeModal === 'contact' && '✉️ お問い合わせ'}
                 {activeModal === 'auth' &&
-                  (authMode === 'otp'
-                    ? '🔐 メール認証コード確認'
+                  (authMode === 'awaitConfirm'
+                    ? '📧 確認メールを送信しました'
+                    : authMode === 'setNewPassword'
+                      ? '🔑 新しいパスワードを設定'
                     : authMode === 'forgot' || authMode === 'forgotSent'
                       ? '🔑 パスワード再設定'
                       : '🔐 アカウント登録 / ログイン')}
@@ -3092,7 +3254,7 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
                       lineHeight: 1.7,
                     }}
                   >
-                    無料会員登録が完了しました。
+                    {SIGNUP_WELCOME_MESSAGE}
                   </p>
                   <div
                     style={{
@@ -3488,7 +3650,7 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
                     </>
                   )}
 
-                  {authMode === 'otp' && (
+                  {authMode === 'awaitConfirm' && (
                     <div
                       style={{
                         padding: '14px',
@@ -3500,10 +3662,54 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
                         lineHeight: 1.7,
                       }}
                     >
-                      <strong>{authEmail}</strong> 宛に確認コードを送信しました。
+                      <strong>{authEmail}</strong> 宛に確認メールを送信しました。
                       <br />
-                      メールに送信された6桁の認証コードを入力してください。
+                      メール内の確認ボタンを押してください。この画面は開いたままお待ちください。認証完了後、自動的にログインします。
+                      {authError && (
+                        <div style={{ marginTop: 10, color: '#b91c1c', fontWeight: 700 }}>{authError}</div>
+                      )}
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 12 }}>
+                        <button
+                          type="button"
+                          disabled={authSubmitting}
+                          onClick={() => void handleResendSignupOtp()}
+                          style={{
+                            background: 'transparent',
+                            border: 'none',
+                            color: '#3730a3',
+                            fontWeight: 700,
+                            cursor: authSubmitting ? 'not-allowed' : 'pointer',
+                            textDecoration: 'underline',
+                            fontSize: 13,
+                          }}
+                        >
+                          {authSubmitting ? '再送中...' : '確認メールを再送する'}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setAuthError(null);
+                            setAuthMode('signup');
+                          }}
+                          style={{
+                            background: 'transparent',
+                            border: 'none',
+                            color: COLORS.textMuted,
+                            fontWeight: 700,
+                            cursor: 'pointer',
+                            fontSize: 13,
+                          }}
+                        >
+                          登録画面に戻る
+                        </button>
+                      </div>
                     </div>
+                  )}
+
+                  {authMode === 'setNewPassword' && (
+                    <p style={{ margin: 0, fontSize: '14px', color: COLORS.textMuted, lineHeight: 1.7 }}>
+                      認証が完了しました。新しいパスワードを入力してください。
+                    </p>
                   )}
 
                   {authMode === 'forgot' && (
@@ -3546,7 +3752,7 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
                     </div>
                   )}
 
-                  {authMode !== 'forgotSent' && (
+                  {authMode !== 'forgotSent' && authMode !== 'awaitConfirm' && (
                     <form onSubmit={handleAuthEmailSubmit} style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
                       {(authMode === 'signup' || authMode === 'login' || authMode === 'forgot') && (
                         <label style={{ display: 'block', fontSize: '12px', color: COLORS.textDim, fontWeight: 700 }}>
@@ -3607,30 +3813,33 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
                         </div>
                       )}
 
-                      {authMode === 'otp' && (
-                        <label style={{ display: 'block', fontSize: '12px', color: COLORS.textDim, fontWeight: 700 }}>
-                          6桁の認証コード
-                          <input
-                            type="text"
-                            inputMode="numeric"
-                            pattern="[0-9]{6}"
-                            maxLength={6}
-                            required
-                            value={authOtpCode}
-                            onChange={(e) => setAuthOtpCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
-                            disabled={authSubmitting}
-                            placeholder="123456"
-                            style={{
-                              ...inputStyle,
-                              marginTop: '6px',
-                              letterSpacing: '0.35em',
-                              fontWeight: 800,
-                              fontSize: 18,
-                              textAlign: 'center',
-                            }}
-                            autoComplete="one-time-code"
-                          />
-                        </label>
+                      {authMode === 'setNewPassword' && (
+                        <>
+                          <label style={{ display: 'block', fontSize: '12px', color: COLORS.textDim, fontWeight: 700 }}>
+                            新しいパスワード
+                            <input
+                              type="password"
+                              required
+                              value={newPassword}
+                              onChange={(e) => setNewPassword(e.target.value)}
+                              disabled={authSubmitting}
+                              style={{ ...inputStyle, marginTop: '6px' }}
+                              autoComplete="new-password"
+                            />
+                          </label>
+                          <label style={{ display: 'block', fontSize: '12px', color: COLORS.textDim, fontWeight: 700 }}>
+                            新しいパスワード（確認）
+                            <input
+                              type="password"
+                              required
+                              value={newPasswordConfirm}
+                              onChange={(e) => setNewPasswordConfirm(e.target.value)}
+                              disabled={authSubmitting}
+                              style={{ ...inputStyle, marginTop: '6px' }}
+                              autoComplete="new-password"
+                            />
+                          </label>
+                        </>
                       )}
 
                       {authMode === 'signup' && (
@@ -3744,53 +3953,30 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
                         }}
                       >
                         {authSubmitting
-                          ? authMode === 'otp'
-                            ? '認証中...'
+                          ? authMode === 'setNewPassword'
+                            ? '更新中...'
                             : authMode === 'forgot'
                               ? '送信中...'
                               : authMode === 'signup'
                                 ? '登録中...'
                                 : 'ログイン中...'
-                          : authMode === 'otp'
-                            ? '認証コードを確認する'
+                          : authMode === 'setNewPassword'
+                            ? '新しいパスワードを保存する'
                             : authMode === 'forgot'
                               ? '再設定メールを送信する'
                               : authMode === 'signup'
-                                ? authIntent === 'paywall'
-                                  ? '確認コードを受け取る'
-                                  : '確認コードを受け取る'
+                                ? '確認メールを受け取る'
                                 : authIntent === 'paywall'
                                   ? 'ログインして決済へ進む'
                                   : 'ログインする'}
                       </button>
 
-                      {authMode === 'otp' && (
-                        <button
-                          type="button"
-                          disabled={authSubmitting}
-                          onClick={() => void handleResendSignupOtp()}
-                          style={{
-                            background: 'none',
-                            border: 'none',
-                            color: COLORS.accent,
-                            fontSize: 12,
-                            fontWeight: 700,
-                            cursor: authSubmitting ? 'not-allowed' : 'pointer',
-                            textDecoration: 'underline',
-                            padding: 0,
-                          }}
-                        >
-                          コードを再送する
-                        </button>
-                      )}
-
-                      {(authMode === 'otp' || authMode === 'forgot') && (
+                      {authMode === 'forgot' && (
                         <button
                           type="button"
                           disabled={authSubmitting}
                           onClick={() => {
-                            setAuthMode(authMode === 'otp' ? 'signup' : 'login');
-                            setAuthOtpCode('');
+                            setAuthMode('login');
                             setAuthError(null);
                           }}
                           style={{

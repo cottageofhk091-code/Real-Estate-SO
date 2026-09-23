@@ -2,10 +2,16 @@ import { NextResponse, type NextRequest } from 'next/server';
 
 export async function GET(request: NextRequest) {
   const { searchParams, origin } = new URL(request.url);
-  
-  // 受け取ったクエリパラメータをそのままリセット画面へ転送
+  const type = (searchParams.get('type') || '').toLowerCase();
+  const next = searchParams.get('next') || '';
   const search = searchParams.toString();
-  const destination = search ? `${origin}/auth/reset-password?${search}&setup=1` : `${origin}/auth/reset-password?setup=1`;
+  const qs = search ? `?${search}` : '';
 
-  return NextResponse.redirect(destination);
+  if (type === 'recovery' || next.includes('reset-password')) {
+    return NextResponse.redirect(`${origin}/auth/password-reset-notice${qs}`);
+  }
+  if (type === 'signup' || type === 'email' || type === 'magiclink') {
+    return NextResponse.redirect(`${origin}/auth/confirmed${qs}`);
+  }
+  return NextResponse.redirect(`${origin}/auth/confirmed${qs}`);
 }

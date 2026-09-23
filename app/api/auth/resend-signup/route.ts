@@ -1,5 +1,11 @@
 import { NextResponse } from 'next/server';
-import { supabase } from '@/lib/supabase';
+import { sendSignupConfirmationEmail } from '@/lib/auth-email';
+import {
+  findAuthUserByEmail,
+  generateAuthActionLink,
+  hasSupabaseAdminAuth,
+  isAuthUserConfirmed,
+} from '@/lib/supabase-admin';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -8,12 +14,9 @@ type Body = {
   email?: unknown;
 };
 
-/**
- * 会員登録用 OTP メールの再送。
- */
 export async function POST(req: Request) {
   try {
-    if (!supabase) {
+    if (!hasSupabaseAdminAuth() || !process.env.RESEND_API_KEY?.trim()) {
       return NextResponse.json({ error: '再送の準備ができていません。' }, { status: 503 });
     }
 
@@ -29,22 +32,30 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: '有効なメールアドレスを入力してください。' }, { status: 400 });
     }
 
-    const { error } = await supabase.auth.resend({
-      type: 'signup',
-      email,
-    });
-
-    if (error) {
-      console.error('[auth/resend-signup] error:', error.message);
+    const existing = await findAuthUserByEmail(email);
+    if (existing && isAuthUserConfirmed(existing)) {
       return NextResponse.json(
-        { error: error.message || '確認コードの再送に失敗しました。' },
+        { error: 'このメールアドレスは既に確認済みです。ログインしてください。' },
         { status: 400 }
       );
     }
 
-    return NextResponse.json({ ok: true, email, message: '確認コードを再送しました。' });
+    const link = await generateAuthActionLink({ type: 'magiclink', email, req });
+    const sent = await sendSignupConfirmationEmail(email, link.actionUrl);
+    if (!sent.sent) {
+      return NextResponse.json(
+        { error: sent.error || '確認メールの再送に失敗しました。' },
+        { status: 502 }
+      );
+    }
+
+    return NextResponse.json({
+      ok: true,
+      email,
+      message: '確認メールを再送しました。この画面は開いたままお待ちください。',
+    });
   } catch (err) {
     console.error('[auth/resend-signup] unexpected:', err);
-    return NextResponse.json({ error: '確認コードの再送中にエラーが発生しました。' }, { status: 500 });
+    return NextResponse.json({ error: '確認メールの再送中にエラーが発生しました。' }, { status: 500 });
   }
 }

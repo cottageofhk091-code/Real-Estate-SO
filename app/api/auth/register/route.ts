@@ -1,9 +1,20 @@
 import { NextResponse } from 'next/server';
 import { isAgeGroup, isPrefecture } from '@/lib/survey-options';
-import { APP_NAME_REALESTATE, supabase } from '@/lib/supabase';
+import { sendSignupConfirmationEmail } from '@/lib/auth-email';
+import {
+  findAuthUserByEmail,
+  generateAuthActionLink,
+  getSupabaseAdmin,
+  hasSupabaseAdminAuth,
+  isAuthUserConfirmed,
+} from '@/lib/supabase-admin';
+import { APP_NAME_REALESTATE } from '@/lib/supabase';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
+
+const SENT_MESSAGE =
+  '確認メールを送りました。メール内の確認ボタンをクリックしてください。この画面は開いたままお待ちください。';
 
 type RegisterBody = {
   email?: unknown;
@@ -13,17 +24,16 @@ type RegisterBody = {
   agreedToTerms?: unknown;
 };
 
-/**
- * 会員登録の第一段階: Supabase Auth にサインアップし、確認メール（OTP）を送る。
- * users_profiles は OTP 検証後に保存する。
- */
 export async function POST(req: Request) {
   try {
-    if (!supabase) {
+    if (!hasSupabaseAdminAuth()) {
       return NextResponse.json(
-        { error: '会員登録の準備ができていません。しばらくしてから再度お試しください。' },
-        { status: 503 }
+        { error: '会員登録の準備ができていません（SUPABASE_SERVICE_ROLE_KEY）。' },
+        { status: 500 }
       );
+    }
+    if (!process.env.RESEND_API_KEY?.trim()) {
+      return NextResponse.json({ error: 'RESEND_API_KEY が未設定です。' }, { status: 500 });
     }
 
     let body: RegisterBody;
@@ -43,10 +53,7 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: '有効なメールアドレスを入力してください。' }, { status: 400 });
     }
     if (password.length < 8) {
-      return NextResponse.json(
-        { error: 'パスワードは8文字以上で入力してください。' },
-        { status: 400 }
-      );
+      return NextResponse.json({ error: 'パスワードは8文字以上で入力してください。' }, { status: 400 });
     }
     if (!agreed) {
       return NextResponse.json(
@@ -61,45 +68,65 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: '地域（都道府県）を選択してください。' }, { status: 400 });
     }
 
-    const { data: signUpData, error: signUpError } = await supabase.auth.signUp({
-      email,
-      password,
-      options: {
+    const existing = await findAuthUserByEmail(email);
+    if (existing && isAuthUserConfirmed(existing)) {
+      return NextResponse.json({ error: 'このメールアドレスは既に登録されています。' }, { status: 409 });
+    }
+
+    if (existing && !isAuthUserConfirmed(existing)) {
+      const admin = getSupabaseAdmin();
+      const { error: updateError } = await admin.auth.admin.updateUserById(existing.id, {
+        password,
+        user_metadata: {
+          app_name: APP_NAME_REALESTATE,
+          age_group: ageGroup,
+          region,
+        },
+      });
+      if (updateError) {
+        return NextResponse.json({ error: updateError.message }, { status: 400 });
+      }
+    }
+
+    let link;
+    try {
+      link = await generateAuthActionLink({
+        type: existing ? 'magiclink' : 'signup',
+        email,
+        password,
         data: {
           app_name: APP_NAME_REALESTATE,
           age_group: ageGroup,
           region,
-          // 氏名・住所・電話は保存しない
         },
-      },
-    });
-
-    if (signUpError) {
-      console.error('[auth/register] signUp error:', signUpError.message);
-      return NextResponse.json(
-        { error: signUpError.message || '会員登録に失敗しました。' },
-        { status: 400 }
-      );
+        req,
+      });
+    } catch (linkErr) {
+      const detail = linkErr instanceof Error ? linkErr.message : String(linkErr);
+      if (/already registered|already been registered|user_already_exists/i.test(detail)) {
+        const again = await findAuthUserByEmail(email);
+        if (again && isAuthUserConfirmed(again)) {
+          return NextResponse.json({ error: 'このメールアドレスは既に登録されています。' }, { status: 409 });
+        }
+        link = await generateAuthActionLink({ type: 'magiclink', email, req });
+      } else {
+        return NextResponse.json({ error: detail || '確認メールの準備に失敗しました。' }, { status: 400 });
+      }
     }
 
-    // すでに登録済みで未確認の場合など、identities が空のことがある
-    if (signUpData.user && Array.isArray(signUpData.user.identities) && signUpData.user.identities.length === 0) {
+    const sent = await sendSignupConfirmationEmail(email, link.actionUrl);
+    if (!sent.sent) {
       return NextResponse.json(
-        {
-          error:
-            'このメールアドレスは既に登録されているか、確認待ちです。ログインするか、届いている確認メールをご確認ください。',
-        },
-        { status: 400 }
+        { error: sent.error || '確認メールの送信に失敗しました。' },
+        { status: 502 }
       );
     }
 
     return NextResponse.json({
       ok: true,
-      requiresOtp: true,
+      requiresEmailConfirm: true,
       email,
-      age_group: ageGroup,
-      region,
-      message: '確認コードをメールに送信しました。',
+      message: SENT_MESSAGE,
     });
   } catch (err) {
     console.error('[auth/register] unexpected:', err);

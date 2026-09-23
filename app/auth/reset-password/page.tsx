@@ -14,6 +14,14 @@ export default function ResetPasswordPage() {
   const [done, setDone] = useState(false);
 
   useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('token_hash') || params.get('code') || params.get('setup')) {
+      window.location.replace(
+        `/auth/password-reset-notice${window.location.search}${window.location.hash}`
+      );
+      return;
+    }
+
     const client = createBrowserSupabase();
     if (!client) {
       setError('認証の準備ができていません。');

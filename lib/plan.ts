@@ -18,6 +18,8 @@ export type PurchasedPropertyRecord = {
   sourceText?: string;
   /** 購入時点の診断結果（あればマイページから復元） */
   cachedResult?: AnalysisSnapshot | null;
+  /** 無料体験で一時解放した物件（選び直し後は Pro ロック対象） */
+  fromFreeTrial?: boolean;
 };
 
 export type AnalysisSnapshot = {
@@ -287,15 +289,18 @@ export function extractLocationOrUrl(sourceText: string): string {
 export function canAccessProFeatures(params: {
   user: AppUser;
   currentPropertyId: string | null;
+  sessionTrialUnlock?: boolean;
 }): boolean {
-  const { user, currentPropertyId } = params;
+  const { user, currentPropertyId, sessionTrialUnlock } = params;
   if (!user) return false;
 
   if (user.plan === 'MONTHLY') return true;
 
+  if (sessionTrialUnlock) return true;
+
   if (
     currentPropertyId &&
-    user.purchasedProperties.some((p) => p.propertyId === currentPropertyId)
+    user.purchasedProperties.some((p) => p.propertyId === currentPropertyId && !p.fromFreeTrial)
   ) {
     return true;
   }
@@ -555,6 +560,7 @@ function normalizePurchasedList(raw: unknown): PurchasedPropertyRecord[] {
         propertyType: rec.propertyType === 'purchase' ? 'purchase' : 'rental',
         sourceText: typeof rec.sourceText === 'string' ? rec.sourceText : undefined,
         cachedResult: (rec.cachedResult as AnalysisSnapshot | null | undefined) ?? null,
+        fromFreeTrial: rec.fromFreeTrial === true,
       };
     })
     .filter((x): x is PurchasedPropertyRecord => !!x);

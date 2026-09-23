@@ -1,21 +1,24 @@
 import { NextResponse } from 'next/server';
-import { supabase } from '@/lib/supabase';
+import { sendPasswordResetEmail } from '@/lib/auth-email';
+import { generateAuthActionLink, hasSupabaseAdminAuth } from '@/lib/supabase-admin';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
 type Body = {
   email?: unknown;
-  redirectTo?: unknown;
 };
 
 export async function POST(req: Request) {
   try {
-    if (!supabase) {
+    if (!hasSupabaseAdminAuth()) {
       return NextResponse.json(
         { error: 'パスワード再設定の準備ができていません。' },
         { status: 503 }
       );
+    }
+    if (!process.env.RESEND_API_KEY?.trim()) {
+      return NextResponse.json({ error: 'RESEND_API_KEY が未設定です。' }, { status: 500 });
     }
 
     let body: Body;
@@ -30,31 +33,24 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: '有効なメールアドレスを入力してください。' }, { status: 400 });
     }
 
-    // リクエスト元のドメインを取得
-    const origin =
-      req.headers.get('origin') ||
-      process.env.NEXT_PUBLIC_APP_URL ||
-      'https://real-estate-so.vercel.app';
-
-    // 💡 重要: PKCE認証コードを受け取る callback のパスを指定し、
-    // 次の遷移先（next）として /auth/reset-password を付与します
-    const redirectTo = `${origin.replace(/\/$/, '')}/api/auth/callback?next=/auth/reset-password`;
-
-    const { error } = await supabase.auth.resetPasswordForEmail(email, {
-      redirectTo,
-    });
-
-    if (error) {
-      console.error('[auth/forgot-password] error:', error.message);
-      return NextResponse.json(
-        { error: error.message || '再設定メールの送信に失敗しました。' },
-        { status: 400 }
-      );
+    try {
+      const link = await generateAuthActionLink({ type: 'recovery', email, req });
+      const sent = await sendPasswordResetEmail(email, link.actionUrl);
+      if (!sent.sent) {
+        return NextResponse.json(
+          { error: sent.error || '再設定メールの送信に失敗しました。' },
+          { status: 502 }
+        );
+      }
+    } catch (err) {
+      console.error('[auth/forgot-password] generate/send:', err);
+      // 未登録メールでも成功扱い（列挙防止）
     }
 
     return NextResponse.json({
       ok: true,
-      message: '登録済みの場合、パスワード再設定用のメールを送信しました。',
+      message:
+        '登録済みの場合、パスワード再設定用のメールを送信しました。この画面は開いたままお待ちください。',
     });
   } catch (err) {
     console.error('[auth/forgot-password] unexpected:', err);
