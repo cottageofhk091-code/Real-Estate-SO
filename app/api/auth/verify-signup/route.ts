@@ -5,6 +5,7 @@ import {
   getSupabaseAdminOrAnon,
   supabase,
 } from '@/lib/supabase';
+import { translateAuthError } from '@/lib/auth-error-translator';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -56,7 +57,7 @@ export async function POST(req: Request) {
     if (error) {
       console.error('[auth/verify-signup] verifyOtp error:', error.message);
       return NextResponse.json(
-        { error: error.message || '認証コードが正しくないか、有効期限切れです。' },
+        { error: translateAuthError(error, '認証コードが正しくないか、有効期限切れです。') },
         { status: 400 }
       );
     }

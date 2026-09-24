@@ -1,4 +1,5 @@
 import { NextResponse } from 'next/server';
+import { jsonErrorWithDetail, jsonServiceUnavailable, serializeUnknownError } from '@/lib/auth-api-error';
 import { isAgeGroup, isPrefecture } from '@/lib/survey-options';
 import { sendSignupConfirmationEmail } from '@/lib/auth-email';
 import {
@@ -27,13 +28,21 @@ type RegisterBody = {
 export async function POST(req: Request) {
   try {
     if (!hasSupabaseAdminAuth()) {
-      return NextResponse.json(
-        { error: '会員登録の準備ができていません（SUPABASE_SERVICE_ROLE_KEY）。' },
-        { status: 500 }
+      return jsonServiceUnavailable(
+        'auth/register',
+        '会員登録の準備ができていません（SUPABASE_SERVICE_ROLE_KEY 未設定）。',
+        {
+          message: 'SUPABASE_SERVICE_ROLE_KEY is missing. generateLink / 確認メール発行ができません。',
+          cause: 'supabase_service_role_missing',
+        }
       );
     }
     if (!process.env.RESEND_API_KEY?.trim()) {
-      return NextResponse.json({ error: 'RESEND_API_KEY が未設定です。' }, { status: 500 });
+      return jsonServiceUnavailable(
+        'auth/register',
+        'RESEND_API_KEY が未設定です。',
+        { message: 'RESEND_API_KEY is missing', cause: 'resend_api_key_missing' }
+      );
     }
 
     let body: RegisterBody;
@@ -84,7 +93,13 @@ export async function POST(req: Request) {
         },
       });
       if (updateError) {
-        return NextResponse.json({ error: updateError.message }, { status: 400 });
+        console.error('[auth/register] updateUserById failed:', serializeUnknownError(updateError));
+        return jsonErrorWithDetail(
+          'auth/register',
+          400,
+          updateError.message,
+          serializeUnknownError(updateError)
+        );
       }
     }
 
@@ -102,23 +117,43 @@ export async function POST(req: Request) {
         req,
       });
     } catch (linkErr) {
-      const detail = linkErr instanceof Error ? linkErr.message : String(linkErr);
+      const serialized = serializeUnknownError(linkErr);
+      const detail = typeof serialized.message === 'string' ? serialized.message : String(linkErr);
+      console.error('[auth/register] generateAuthActionLink failed:', serialized);
       if (/already registered|already been registered|user_already_exists/i.test(detail)) {
         const again = await findAuthUserByEmail(email);
         if (again && isAuthUserConfirmed(again)) {
           return NextResponse.json({ error: 'このメールアドレスは既に登録されています。' }, { status: 409 });
         }
-        link = await generateAuthActionLink({ type: 'magiclink', email, req });
+        try {
+          link = await generateAuthActionLink({ type: 'magiclink', email, req });
+        } catch (retryErr) {
+          const retryDetail = serializeUnknownError(retryErr);
+          console.error('[auth/register] generateAuthActionLink retry failed:', retryDetail);
+          return jsonServiceUnavailable(
+            'auth/register',
+            typeof retryDetail.message === 'string'
+              ? retryDetail.message
+              : '確認メールの準備に失敗しました。',
+            retryDetail
+          );
+        }
       } else {
-        return NextResponse.json({ error: detail || '確認メールの準備に失敗しました。' }, { status: 400 });
+        return jsonServiceUnavailable(
+          'auth/register',
+          detail || '確認メールの準備に失敗しました。',
+          serialized
+        );
       }
     }
 
     const sent = await sendSignupConfirmationEmail(email, link.actionUrl);
     if (!sent.sent) {
-      return NextResponse.json(
-        { error: sent.error || '確認メールの送信に失敗しました。' },
-        { status: 502 }
+      console.error('[auth/register] Resend send failed:', sent);
+      return jsonServiceUnavailable(
+        'auth/register',
+        sent.error || '確認メールの送信に失敗しました。',
+        { message: sent.error, cause: 'resend_send_failed', body: sent.detail ?? null }
       );
     }
 
@@ -129,10 +164,12 @@ export async function POST(req: Request) {
       message: SENT_MESSAGE,
     });
   } catch (err) {
-    console.error('[auth/register] unexpected:', err);
-    return NextResponse.json(
-      { error: '会員登録中にエラーが発生しました。もう一度お試しください。' },
-      { status: 500 }
+    const detail = serializeUnknownError(err);
+    console.error('[auth/register] unexpected:', detail, err);
+    return jsonServiceUnavailable(
+      'auth/register',
+      typeof detail.message === 'string' ? detail.message : '会員登録中にエラーが発生しました。',
+      detail
     );
   }
 }

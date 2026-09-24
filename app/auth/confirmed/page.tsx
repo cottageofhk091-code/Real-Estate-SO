@@ -4,6 +4,7 @@ import { useEffect, useState } from 'react';
 import type { EmailOtpType } from '@supabase/supabase-js';
 import { createBrowserSupabase } from '@/lib/supabase-browser';
 import { notifySignupConfirmed } from '@/lib/auth-client';
+import { translateAuthError } from '@/lib/auth-error-translator';
 
 const OTP_TYPES = new Set<EmailOtpType>([
   'signup',
@@ -66,7 +67,7 @@ export default function AuthConfirmedPage() {
       } catch (err) {
         if (cancelled) return;
         setStatus('error');
-        setMessage(err instanceof Error ? err.message : 'リンクが無効か、有効期限が切れています。');
+        setMessage(translateAuthError(err, 'リンクが無効か、有効期限が切れています。'));
       }
     })();
 

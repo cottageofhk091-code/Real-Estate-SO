@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import { getAppBaseUrl, getStripe, isStripeSecretConfigured } from '@/lib/stripe';
 import { getServerUser } from '@/lib/entitlements';
 import { KvNotConfiguredError, isKvConfigured } from '@/lib/kv';
+import { translateAuthError } from '@/lib/auth-error-translator';
 
 type PortalBody = {
   userId?: string;
@@ -61,9 +62,9 @@ export async function POST(req: Request) {
   } catch (error: unknown) {
     console.error('Portal session error:', error);
     if (error instanceof KvNotConfiguredError) {
-      return NextResponse.json({ error: error.message }, { status: 503 });
+      return NextResponse.json({ error: translateAuthError(error.message) }, { status: 503 });
     }
-    const message = error instanceof Error ? error.message : 'Portal Session の作成に失敗しました。';
+    const message = translateAuthError(error, 'Portal Session の作成に失敗しました。');
     return NextResponse.json({ error: message }, { status: 500 });
   }
 }

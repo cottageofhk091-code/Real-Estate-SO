@@ -47,7 +47,7 @@ async function sendAppEmail(input: {
   subject: string;
   html: string;
   text: string;
-}): Promise<{ sent: boolean; error?: string }> {
+}): Promise<{ sent: boolean; error?: string; detail?: string }> {
   const apiKey = process.env.RESEND_API_KEY?.trim();
   if (!apiKey) {
     return { sent: false, error: 'RESEND_API_KEY が設定されていません。' };
@@ -70,7 +70,11 @@ async function sendAppEmail(input: {
   const body = await res.text().catch(() => '');
   if (!res.ok) {
     console.error('[auth-email] Resend failed', res.status, body);
-    return { sent: false, error: '認証メールの送信に失敗しました。' };
+    return {
+      sent: false,
+      error: '認証メールの送信に失敗しました。',
+      detail: `status=${res.status} body=${body.slice(0, 800)}`,
+    };
   }
   return { sent: true };
 }
@@ -78,7 +82,7 @@ async function sendAppEmail(input: {
 export async function sendSignupConfirmationEmail(
   to: string,
   actionUrl: string
-): Promise<{ sent: boolean; error?: string }> {
+): Promise<{ sent: boolean; error?: string; detail?: string }> {
   const subject = `【${AUTH_APP_NAME}】会員登録のご確認`;
   const body = `${AUTH_APP_NAME} への会員登録ありがとうございます。\n下のボタンを押してメールアドレスを確認すると、登録が完了します。`;
   return sendAppEmail({
@@ -97,7 +101,7 @@ export async function sendSignupConfirmationEmail(
 export async function sendPasswordResetEmail(
   to: string,
   actionUrl: string
-): Promise<{ sent: boolean; error?: string }> {
+): Promise<{ sent: boolean; error?: string; detail?: string }> {
   const subject = `【${AUTH_APP_NAME}】パスワード再設定のご案内`;
   const body = `${AUTH_APP_NAME} のパスワード再設定リクエストを受け付けました。\n下のボタンを押して認証を完了したあと、元の画面に戻って新しいパスワードを入力してください。`;
   return sendAppEmail({

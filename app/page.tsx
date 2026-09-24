@@ -44,6 +44,7 @@ import {
   writeUserState,
 } from '@/lib/plan';
 import { createBrowserSupabase } from '@/lib/supabase-browser';
+import { translateApiError, translateAuthError } from '@/lib/auth-error-translator';
 import {
   AUTH_CHANNEL,
   AUTH_PING_KEY,
@@ -275,23 +276,23 @@ function resolveApiErrorDisplay(input: {
 
   if (kind === 'config' || input.code?.startsWith('CONFIG_')) {
     return {
-      message: IS_DEV && input.detail ? input.detail : input.error || API_CONFIG_MESSAGE,
+      message: translateApiError(input.error || API_CONFIG_MESSAGE, API_CONFIG_MESSAGE),
       retryable: false,
     };
   }
 
   if (kind === 'client') {
-    return { message: raw, retryable: false };
+    return { message: translateApiError(raw), retryable: false };
   }
 
   if (retryable || kind === 'temporary') {
     return {
-      message: IS_DEV && input.detail ? `${API_FALLBACK_MESSAGE}\n（詳細: ${input.detail.slice(0, 240)}）` : API_FALLBACK_MESSAGE,
+      message: API_FALLBACK_MESSAGE,
       retryable: true,
     };
   }
 
-  return { message: raw, retryable: false };
+  return { message: translateApiError(raw), retryable: false };
 }
 
 function DisclaimerNotice({ compact = false }: { compact?: boolean }) {
@@ -603,8 +604,10 @@ export default function Home() {
             setActiveModal('paywall');
           } else {
             setPaywallMessage(
-              confirmData.error ||
+              translateApiError(
+                confirmData.error,
                 '決済の確認に失敗しました。反映まで数分かかる場合があります。マイページでご確認ください。'
+              )
             );
             setActiveModal('paywall');
           }
@@ -1050,8 +1053,16 @@ export default function Home() {
           userId?: string;
           email?: string;
           free_pro_credits?: number;
+          error?: string;
+          detail?: { message?: string } | string | null;
         };
-        if (!res.ok || !json.userId) return;
+        if (!res.ok || !json.userId) {
+          console.error('[auth/complete] client failed', res.status, json);
+          setAuthError(translateAuthError(json.error || json.detail, '登録完了処理に失敗しました。'));
+          setAuthMode('awaitConfirm');
+          setActiveModal('auth');
+          return;
+        }
         completeAuthAndContinue(json.email || userRef.current.email || '', 'email', json.userId, {
           showSignupThanks: true,
           freeProCredits: typeof json.free_pro_credits === 'number' ? json.free_pro_credits : 0,
@@ -1160,7 +1171,7 @@ export default function Home() {
         });
         const data = (await res.json().catch(() => ({}))) as { error?: string };
         if (!res.ok) {
-          setAuthError(data.error || '再設定メールの送信に失敗しました。');
+          setAuthError(translateAuthError(data.error, '再設定メールの送信に失敗しました。'));
           setAuthSubmitting(false);
           return;
         }
@@ -1193,7 +1204,7 @@ export default function Home() {
         }
         const { error } = await client.auth.updateUser({ password: newPassword });
         if (error) {
-          setAuthError(error.message || 'パスワードの更新に失敗しました。');
+          setAuthError(translateAuthError(error, 'パスワードの更新に失敗しました。'));
           setAuthSubmitting(false);
           return;
         }
@@ -1252,11 +1263,12 @@ export default function Home() {
         });
         const data = (await res.json().catch(() => ({}))) as {
           error?: string;
+          detail?: { message?: string } | string | null;
           ok?: boolean;
           requiresEmailConfirm?: boolean;
         };
         if (!res.ok) {
-          setAuthError(data.error || '会員登録に失敗しました。');
+          setAuthError(translateAuthError(data.error || data.detail, '会員登録に失敗しました。'));
           setAuthSubmitting(false);
           return;
         }
@@ -1279,7 +1291,7 @@ export default function Home() {
       };
 
       if (!res.ok || !data.userId) {
-        setAuthError(data.error || 'ログインに失敗しました。');
+        setAuthError(translateAuthError(data.error, 'ログインに失敗しました。'));
         setAuthSubmitting(false);
         return;
       }
@@ -1313,7 +1325,7 @@ export default function Home() {
       });
       const data = (await res.json().catch(() => ({}))) as { error?: string };
       if (!res.ok) {
-        setAuthError(data.error || '確認メールの再送に失敗しました。');
+        setAuthError(translateAuthError(data.error, '確認メールの再送に失敗しました。'));
       } else {
         setAuthError(null);
         setPaywallMessage(null);
@@ -1628,7 +1640,7 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
       const isNetworkLike =
         /failed to fetch|networkerror|load failed|network/i.test(message) ||
         message === 'Failed to fetch';
-      setError(isNetworkLike ? API_FALLBACK_MESSAGE : message);
+      setError(isNetworkLike ? API_FALLBACK_MESSAGE : translateApiError(message, API_FALLBACK_MESSAGE));
       setErrorRetryable(retryable || isNetworkLike);
     } finally {
       window.clearTimeout(timeoutId);
@@ -1753,7 +1765,7 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
       const isNetworkLike =
         /failed to fetch|networkerror|load failed|network/i.test(messageText) ||
         messageText === 'Failed to fetch';
-      setChatError(isNetworkLike ? API_FALLBACK_MESSAGE : messageText);
+      setChatError(isNetworkLike ? API_FALLBACK_MESSAGE : translateApiError(messageText, API_FALLBACK_MESSAGE));
       setChatErrorRetryable(retryable || isNetworkLike);
     } finally {
       window.clearTimeout(timeoutId);
@@ -1822,7 +1834,7 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
       }, 2500);
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : '予期せぬエラーが発生しました。';
-      setContactError(message);
+      setContactError(translateApiError(message, 'お問い合わせの送信に失敗しました。'));
     } finally {
       setContactSubmitting(false);
     }
@@ -1871,7 +1883,7 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
       window.location.href = data.url as string;
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : 'Stripe決済テストの開始に失敗しました。';
-      setStripeTestError(message);
+      setStripeTestError(translateApiError(message, 'Stripe決済テストの開始に失敗しました。'));
       setStripeTestLoading(null);
     }
   };
@@ -1951,7 +1963,7 @@ ${result.viewingChecklist.map((v) => `[ ] ${v}`).join('\n')}
       window.location.href = data.url as string;
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : '決済の開始に失敗しました。';
-      setPaywallMessage(message);
+      setPaywallMessage(translateApiError(message, '決済の開始に失敗しました。'));
       setPaywallSubmitting(false);
     }
   };

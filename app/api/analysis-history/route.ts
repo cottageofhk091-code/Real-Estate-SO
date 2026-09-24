@@ -13,6 +13,7 @@ import {
   toClientAnalysisHistory,
 } from '@/lib/entitlements';
 import { KvNotConfiguredError, isKvConfigured } from '@/lib/kv';
+import { translateAuthError } from '@/lib/auth-error-translator';
 import {
   extractLocationOrUrl,
   extractPropertyTitle,
@@ -132,9 +133,9 @@ export async function POST(req: Request) {
   } catch (error: unknown) {
     console.error('[analysis-history] POST error:', error);
     if (error instanceof KvNotConfiguredError) {
-      return NextResponse.json({ error: error.message }, { status: 503 });
+      return NextResponse.json({ error: translateAuthError(error.message) }, { status: 503 });
     }
-    const message = error instanceof Error ? error.message : '履歴の保存に失敗しました。';
+    const message = translateAuthError(error, '履歴の保存に失敗しました。');
     return NextResponse.json({ error: message }, { status: 500 });
   }
 }

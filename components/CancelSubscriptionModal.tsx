@@ -1,6 +1,7 @@
 'use client';
 
 import { useEffect, useState, type CSSProperties, type FormEvent } from 'react';
+import { translateApiError } from '@/lib/auth-error-translator';
 
 export const CANCEL_REASONS = [
   '料金が高い',
@@ -145,7 +146,7 @@ export function CancelSubscriptionModal({
     try {
       await openPortal();
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : '契約管理ページの表示に失敗しました。');
+      setError(translateApiError(err, '契約管理ページの表示に失敗しました。'));
       setLoading(false);
     }
   };

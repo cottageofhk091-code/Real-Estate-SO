@@ -19,6 +19,7 @@ import { clientIdFromRequest, sendGA4Event } from '@/lib/ga4-mp';
 import { emitOpsEventFireAndForget } from '@/lib/ops-events';
 import { supabase } from '@/lib/supabase';
 import { installVercelFsGuard, isFilesystemError } from '@/lib/vercel-fs-guard';
+import { translateApiError } from '@/lib/auth-error-translator';
 
 try {
   installVercelFsGuard();
@@ -83,14 +84,15 @@ function jsonError(
   const kind = extra?.kind ?? kindFromCode(code);
   const retryable =
     typeof extra?.retryable === 'boolean' ? extra.retryable : kind === 'temporary' || kind === 'unknown';
-  const userFacing =
+  const userFacing = translateApiError(
     kind === 'config'
       ? USER_ERROR_MESSAGES.config
       : kind === 'temporary'
         ? USER_ERROR_MESSAGES.temporary
         : kind === 'client'
           ? message || USER_ERROR_MESSAGES.client
-          : message || USER_ERROR_MESSAGES.unknown;
+          : message || USER_ERROR_MESSAGES.unknown
+  );
 
   const payload = compactDefined({
     error: userFacing,

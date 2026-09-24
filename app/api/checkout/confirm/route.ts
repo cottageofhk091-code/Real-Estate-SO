@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import type Stripe from 'stripe';
 import { getStripe, isStripeSecretConfigured } from '@/lib/stripe';
 import { KvNotConfiguredError, isKvConfigured } from '@/lib/kv';
+import { translateAuthError } from '@/lib/auth-error-translator';
 import {
   addPurchasedPropertyToServerUser,
   getServerUser,
@@ -128,9 +129,9 @@ export async function POST(req: Request) {
   } catch (error: unknown) {
     console.error('Checkout confirm error:', error);
     if (error instanceof KvNotConfiguredError) {
-      return NextResponse.json({ error: error.message }, { status: 503 });
+      return NextResponse.json({ error: translateAuthError(error.message) }, { status: 503 });
     }
-    const message = error instanceof Error ? error.message : '決済確認に失敗しました。';
+    const message = translateAuthError(error, '決済確認に失敗しました。');
     return NextResponse.json({ error: message }, { status: 500 });
   }
 }

@@ -4,6 +4,7 @@ import {
   toClientAnalysisHistory,
   toClientPurchasedRecords,
 } from '@/lib/entitlements';
+import { jsonServiceUnavailable, serializeUnknownError } from '@/lib/auth-api-error';
 import { KvNotConfiguredError, isKvConfigured } from '@/lib/kv';
 
 /** Edge では Node fs が使えないため、mkdir('/var/task/data') 系エラーを構造的に排除 */
@@ -28,18 +29,16 @@ function emptyEntitlements(userId: string) {
 
 /**
  * 利用権限（Entitlements）取得 API
- * - KV / Upstash Redis 必須（未設定時は 503）
+ * - KV / Upstash Redis 必須（未設定時は 503 + 詳細 JSON）
  */
 export async function GET(req: Request) {
   let userId = '';
   try {
     if (!isKvConfigured()) {
-      return NextResponse.json(
-        {
-          error:
-            '権利ストア（KV / Upstash Redis）が未設定です。KV_REST_API_* または UPSTASH_REDIS_REST_* を設定してください。',
-        },
-        { status: 503 }
+      return jsonServiceUnavailable(
+        'entitlements',
+        '権利ストア（KV / Upstash Redis）が未設定です。KV_REST_API_* または UPSTASH_REDIS_REST_* を設定してください。',
+        { message: 'KV is not configured', cause: 'kv_not_configured' }
       );
     }
 
@@ -83,10 +82,15 @@ export async function GET(req: Request) {
       },
     });
   } catch (error: unknown) {
-    console.error('[entitlements] GET error:', error);
+    const detail = serializeUnknownError(error);
+    console.error('[entitlements] GET error:', detail, error);
     if (error instanceof KvNotConfiguredError) {
-      return NextResponse.json({ error: error.message }, { status: 503 });
+      return jsonServiceUnavailable('entitlements', error.message, detail);
     }
-    return NextResponse.json(emptyEntitlements(userId || 'unknown'));
+    return jsonServiceUnavailable(
+      'entitlements',
+      typeof detail.message === 'string' ? detail.message : '権利情報の取得に失敗しました。',
+      detail
+    );
   }
 }

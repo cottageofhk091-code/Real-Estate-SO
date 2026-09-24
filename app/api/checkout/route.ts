@@ -10,6 +10,7 @@ import {
   resolveSingleCheckoutLineItem,
 } from '@/lib/stripe';
 import { KvNotConfiguredError, isKvConfigured } from '@/lib/kv';
+import { translateAuthError } from '@/lib/auth-error-translator';
 import { getServerUser, upsertServerUser, type ServerPurchasedProperty } from '@/lib/entitlements';
 
 export type CheckoutPlanType = 'SINGLE' | 'MONTHLY';
@@ -192,7 +193,7 @@ export async function POST(req: Request) {
     if (raw.includes('STRIPE_SECRET_KEY')) {
       return NextResponse.json({ error: STRIPE_NOT_READY_MESSAGE }, { status: 503 });
     }
-    const message = raw || 'Checkout Session の作成に失敗しました。';
+    const message = translateAuthError(raw, 'Checkout Session の作成に失敗しました。');
     return NextResponse.json({ error: message }, { status: 500 });
   }
 }

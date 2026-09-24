@@ -17,6 +17,7 @@ import {
 } from '@/lib/gemini';
 import { emitOpsEventFireAndForget } from '@/lib/ops-events';
 import { installVercelFsGuard, isFilesystemError } from '@/lib/vercel-fs-guard';
+import { translateApiError } from '@/lib/auth-error-translator';
 
 installVercelFsGuard();
 
@@ -37,14 +38,15 @@ function jsonError(
   const kind = extra?.kind ?? kindFromCode(code);
   const retryable =
     typeof extra?.retryable === 'boolean' ? extra.retryable : kind === 'temporary' || kind === 'unknown';
-  const userFacing =
+  const userFacing = translateApiError(
     kind === 'config'
       ? USER_ERROR_MESSAGES.config
       : kind === 'temporary'
         ? USER_ERROR_MESSAGES.temporary
         : kind === 'client'
           ? message || USER_ERROR_MESSAGES.client
-          : message || USER_ERROR_MESSAGES.unknown;
+          : message || USER_ERROR_MESSAGES.unknown
+  );
 
   return NextResponse.json(
     compactDefined({

@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server';
 import { createClient } from '@supabase/supabase-js';
+import { jsonErrorWithDetail, jsonServiceUnavailable, serializeUnknownError } from '@/lib/auth-api-error';
 import { isAgeGroup, isPrefecture } from '@/lib/survey-options';
 import { APP_NAME_REALESTATE, getSupabaseAdminOrAnon } from '@/lib/supabase';
 
@@ -11,9 +12,15 @@ type Body = {
   grantBonus?: unknown;
 };
 
-function readCredits(row: { free_pro_credits?: unknown } | null): number {
+type CreditRow = {
+  free_pro_credits?: unknown;
+  free_credits?: unknown;
+};
+
+function readCredits(row: CreditRow | null): number {
   if (!row) return 0;
   if (typeof row.free_pro_credits === 'number') return Math.max(0, Math.floor(row.free_pro_credits));
+  if (typeof row.free_credits === 'number') return Math.max(0, Math.floor(row.free_credits));
   return 0;
 }
 
@@ -22,7 +29,11 @@ export async function POST(req: Request) {
     const url = process.env.NEXT_PUBLIC_SUPABASE_URL?.trim();
     const anon = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY?.trim();
     if (!url || !anon) {
-      return NextResponse.json({ error: '認証の準備ができていません。' }, { status: 503 });
+      return jsonServiceUnavailable(
+        'auth/complete',
+        '認証の準備ができていません（NEXT_PUBLIC_SUPABASE_URL / ANON_KEY）。',
+        { message: 'Supabase public env missing', cause: 'supabase_public_env_missing' }
+      );
     }
 
     let body: Body;
@@ -44,7 +55,10 @@ export async function POST(req: Request) {
     });
     const { data, error } = await userClient.auth.getUser(accessToken);
     if (error || !data.user?.id) {
-      return NextResponse.json({ error: 'セッションが無効です。' }, { status: 401 });
+      return NextResponse.json(
+        { error: 'セッションが無効です。', detail: error ? serializeUnknownError(error) : null },
+        { status: 401 }
+      );
     }
 
     const userId = data.user.id;
@@ -57,15 +71,29 @@ export async function POST(req: Request) {
 
     const profileClient = getSupabaseAdminOrAnon();
     if (!profileClient) {
-      return NextResponse.json({ error: 'プロフィール保存の準備ができていません。' }, { status: 503 });
+      return jsonServiceUnavailable(
+        'auth/complete',
+        'プロフィール保存の準備ができていません。',
+        { message: 'getSupabaseAdminOrAnon() returned null', cause: 'profile_client_missing' }
+      );
     }
 
-    const { data: existing } = await profileClient
+    const { data: existing, error: selectError } = await profileClient
       .from('users_profiles')
       .select('free_pro_credits')
       .eq('user_id', userId)
       .eq('app_name', APP_NAME_REALESTATE)
       .maybeSingle();
+
+    if (selectError) {
+      const detail = serializeUnknownError(selectError);
+      console.error('[auth/complete] users_profiles select error:', detail);
+      return jsonServiceUnavailable(
+        'auth/complete',
+        selectError.message || 'users_profiles の参照に失敗しました。',
+        { ...detail, cause: 'users_profiles_select_failed', table: 'users_profiles' }
+      );
+    }
 
     if (existing) {
       return NextResponse.json({
@@ -89,7 +117,10 @@ export async function POST(req: Request) {
 
     const { error: insertError } = await profileClient.from('users_profiles').insert([profileRow]);
     if (insertError) {
-      const { data: again } = await profileClient
+      const insertDetail = serializeUnknownError(insertError);
+      console.error('[auth/complete] users_profiles insert error:', insertDetail, profileRow);
+
+      const { data: again, error: againError } = await profileClient
         .from('users_profiles')
         .select('free_pro_credits')
         .eq('user_id', userId)
@@ -104,9 +135,26 @@ export async function POST(req: Request) {
           bonusGranted: false,
         });
       }
-      console.error('[auth/complete] insert error:', insertError.message);
-      return NextResponse.json({ error: 'プロフィールの保存に失敗しました。' }, { status: 500 });
+
+      return jsonServiceUnavailable(
+        'auth/complete',
+        insertError.message || 'プロフィールの保存に失敗しました。',
+        {
+          ...insertDetail,
+          cause: 'users_profiles_insert_failed',
+          table: 'users_profiles',
+          column: 'free_pro_credits',
+          retrySelect: againError ? serializeUnknownError(againError) : null,
+        }
+      );
     }
+
+    console.log('[auth/complete] users_profiles created', {
+      userId,
+      app_name: APP_NAME_REALESTATE,
+      free_pro_credits: initialCredits,
+      grantBonus,
+    });
 
     return NextResponse.json({
       ok: true,
@@ -116,7 +164,12 @@ export async function POST(req: Request) {
       bonusGranted: grantBonus,
     });
   } catch (err) {
-    console.error('[auth/complete] unexpected:', err);
-    return NextResponse.json({ error: '認証完了処理に失敗しました。' }, { status: 500 });
+    const detail = serializeUnknownError(err);
+    console.error('[auth/complete] unexpected:', detail, err);
+    return jsonServiceUnavailable(
+      'auth/complete',
+      typeof detail.message === 'string' ? detail.message : '認証完了処理に失敗しました。',
+      detail
+    );
   }
 }

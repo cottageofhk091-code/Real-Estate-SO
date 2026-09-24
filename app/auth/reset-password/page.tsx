@@ -3,6 +3,7 @@
 import Link from 'next/link';
 import { FormEvent, useEffect, useState } from 'react';
 import { createBrowserSupabase } from '@/lib/supabase-browser';
+import { translateAuthError } from '@/lib/auth-error-translator';
 
 export default function ResetPasswordPage() {
   const [ready, setReady] = useState(false);
@@ -98,7 +99,7 @@ export default function ResetPasswordPage() {
     try {
       const { error: updateError } = await client.auth.updateUser({ password });
       if (updateError) {
-        setError(updateError.message || 'パスワードの更新に失敗しました。');
+        setError(translateAuthError(updateError, 'パスワードの更新に失敗しました。'));
         setSubmitting(false);
         return;
       }

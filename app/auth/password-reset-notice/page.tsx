@@ -4,6 +4,7 @@ import { useEffect, useState } from 'react';
 import type { EmailOtpType } from '@supabase/supabase-js';
 import { createBrowserSupabase } from '@/lib/supabase-browser';
 import { notifyPasswordRecovery } from '@/lib/auth-client';
+import { translateAuthError } from '@/lib/auth-error-translator';
 
 const SUCCESS_TITLE = '認証が完了しました';
 const SUCCESS_BODY = '元の画面（タブ）に戻ってお続けください。このウィンドウは閉じて構いません。';
@@ -43,7 +44,7 @@ export default function PasswordResetNoticePage() {
       } catch (err) {
         if (cancelled) return;
         setStatus('error');
-        setMessage(err instanceof Error ? err.message : 'リンクが無効か、有効期限が切れています。');
+        setMessage(translateAuthError(err, 'リンクが無効か、有効期限が切れています。'));
       }
     })();
 
